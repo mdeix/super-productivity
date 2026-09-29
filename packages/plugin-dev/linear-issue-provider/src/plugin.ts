@@ -206,6 +206,7 @@ PluginAPI.registerIssueProvider({
       label: t('CFG.AUTO_IMPORT_CURRENT_CYCLE_ONLY'),
       description: t('CFG.AUTO_IMPORT_CURRENT_CYCLE_ONLY_DESC'),
       advanced: true,
+      autoImportOnly: true,
     },
   ],
 
