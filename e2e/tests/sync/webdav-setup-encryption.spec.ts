@@ -1,15 +1,37 @@
 import { test, expect } from '../../fixtures/webdav.fixture';
+import type { Page } from '@playwright/test';
 import { SyncPage } from '../../pages/sync.page';
 import { WorkViewPage } from '../../pages/work-view.page';
 import { waitForStatePersistence } from '../../utils/waits';
 import {
   WEBDAV_CONFIG_TEMPLATE,
+  WEBDAV_SYNC_FILE,
+  WEBDAV_SYNC_FORMAT,
   setupSyncClient,
   createSyncFolder,
   waitForSyncComplete,
   generateSyncFolderName,
   closeContextsSafely,
 } from '../../utils/sync-helpers';
+
+// The ops file is only the commit pointer in v3. Include the fixed snapshot and
+// every generation/backup snapshot actually written by this fixture as well.
+const trackSyncFiles = (page: Page, syncFileUrl: string): Set<string> => {
+  const files = new Set([syncFileUrl]);
+  if (WEBDAV_SYNC_FORMAT === 'v3') {
+    const folderUrl = syncFileUrl.slice(0, syncFileUrl.lastIndexOf('/') + 1);
+    files.add(`${folderUrl}sync-state.json`);
+    page.on('request', (request) => {
+      if (
+        request.method() === 'PUT' &&
+        request.url().startsWith(`${folderUrl}sync-state`)
+      ) {
+        files.add(request.url());
+      }
+    });
+  }
+  return files;
+};
 
 /**
  * WebDAV (File-Based) Setup-Time Encryption E2E Test
@@ -20,9 +42,9 @@ import {
  * the normal download-first sync flow (no snapshot-overwrite).
  *
  * Flow:
- * 1. Client A configures WebDAV and sets an encryption password at setup.
- * 2. Client A adds a task and performs its first sync.
- * 3. The raw remote sync file is fetched and asserted to NOT contain the task
+ * 1. Client A creates a task, then configures WebDAV with a password at setup.
+ * 2. The first sync uploads that task in the initial snapshot.
+ * 3. The raw remote sync files are fetched and asserted to NOT contain the task
  *    title in plaintext (compression is off by default, so an unencrypted upload
  *    would contain it verbatim) — proving the first upload was encrypted.
  * 4. Client B configures WebDAV with the SAME password at setup and receives
@@ -45,7 +67,7 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption', () => {
   // Non-production builds nest the sync file under a `/DEV` segment
   // (`environment.production ? undefined : '/DEV'` in sync-providers.factory.ts).
   // E2E always runs a non-production build, so include it here.
-  const SYNC_FILE_URL = `${WEBDAV_CONFIG_TEMPLATE.baseUrl}${SYNC_FOLDER_NAME}/DEV/sync-data.json`;
+  const SYNC_FILE_URL = `${WEBDAV_CONFIG_TEMPLATE.baseUrl}${SYNC_FOLDER_NAME}/DEV/${WEBDAV_SYNC_FILE}`;
   const AUTH_HEADER =
     'Basic ' +
     Buffer.from(
@@ -68,10 +90,17 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption', () => {
     console.log('[SetupEncrypt] Phase 1: Client A setup with setup-time encryption');
 
     const { context: contextA, page: pageA } = await setupSyncClient(browser, url);
+    const syncFiles = trackSyncFiles(pageA, SYNC_FILE_URL);
     const syncPageA = new SyncPage(pageA);
     const workViewPageA = new WorkViewPage(pageA);
 
     await workViewPageA.waitForTaskList();
+
+    // Saving starts the first sync: include the task in that initial snapshot,
+    // so a plaintext snapshot cannot pass merely because it was empty.
+    await workViewPageA.addTask(taskTitle);
+    await expect(pageA.locator('task')).toHaveCount(1);
+    await waitForStatePersistence(pageA);
 
     await syncPageA.setupWebdavSync({
       ...WEBDAV_CONFIG,
@@ -80,11 +109,6 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption', () => {
     });
     await expect(syncPageA.syncBtn).toBeVisible();
 
-    // Add a task and perform the FIRST sync — this upload must already be encrypted.
-    await workViewPageA.addTask(taskTitle);
-    await expect(pageA.locator('task')).toHaveCount(1);
-    await waitForStatePersistence(pageA);
-
     await syncPageA.triggerSync();
     await waitForSyncComplete(pageA, syncPageA);
     console.log(`[SetupEncrypt] Client A synced first task: ${taskTitle}`);
@@ -92,15 +116,16 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption', () => {
     // ============ PHASE 2: The remote blob must NOT be plaintext ============
     console.log('[SetupEncrypt] Phase 2: Verifying the remote file is encrypted');
 
-    const remote = await request.fetch(SYNC_FILE_URL, {
-      headers: { Authorization: AUTH_HEADER },
-    });
-    expect(remote.ok()).toBeTruthy();
-    const remoteBody = await remote.text();
-    expect(remoteBody.length).toBeGreaterThan(0);
-    // Compression is off by default, so a plaintext upload would contain the
-    // task title verbatim. Its absence proves the first upload was encrypted.
-    expect(remoteBody).not.toContain(taskTitle);
+    for (const fileUrl of syncFiles) {
+      const remote = await request.fetch(fileUrl, {
+        headers: { Authorization: AUTH_HEADER },
+      });
+      expect(remote.ok(), fileUrl).toBeTruthy();
+      const remoteBody = await remote.text();
+      expect(remoteBody.length).toBeGreaterThan(0);
+      // Compression is off by default, so plaintext snapshots/ops expose the title.
+      expect(remoteBody, fileUrl).not.toContain(taskTitle);
+    }
     console.log('[SetupEncrypt] Remote file does not contain the plaintext task');
 
     // ============ PHASE 3: Client B joins with the SAME password ============
@@ -131,11 +156,10 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption', () => {
 });
 
 /**
- * Guards the data-safety edge case: a client that sets an encryption password at
- * setup while joining a remote that ALREADY holds UNENCRYPTED data (returning
- * user / new device on an existing plaintext remote). The normal download-first
- * sync must read the plaintext remote, keep the data, and re-upload it encrypted
- * — never overwrite the remote with the joining client's (empty) state.
+ * Guards the downgrade edge case: a client that sets an encryption password at
+ * setup while joining a remote that ALREADY holds UNENCRYPTED data. The remote
+ * prefix is attacker-controlled, so the client must reject the plaintext without
+ * importing it, overwriting it, or silently disabling local encryption.
  */
 test.describe('@webdav @encryption WebDAV Setup-Time Encryption — Unencrypted Remote', () => {
   test.describe.configure({ mode: 'serial' });
@@ -149,14 +173,14 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption — Unencrypted 
   };
 
   // Non-production builds nest the sync file under a `/DEV` segment (see above).
-  const SYNC_FILE_URL = `${WEBDAV_CONFIG_TEMPLATE.baseUrl}${SYNC_FOLDER_NAME}/DEV/sync-data.json`;
+  const SYNC_FILE_URL = `${WEBDAV_CONFIG_TEMPLATE.baseUrl}${SYNC_FOLDER_NAME}/DEV/${WEBDAV_SYNC_FILE}`;
   const AUTH_HEADER =
     'Basic ' +
     Buffer.from(
       `${WEBDAV_CONFIG_TEMPLATE.username}:${WEBDAV_CONFIG_TEMPLATE.password}`,
     ).toString('base64');
 
-  test('preserves data and upgrades the remote to encrypted when a setup-time-encryption client joins an unencrypted remote', async ({
+  test('rejects an unencrypted remote without overwriting it when setup-time encryption is enabled', async ({
     browser,
     baseURL,
     request,
@@ -165,7 +189,6 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption — Unencrypted 
     const url = baseURL || 'http://localhost:4242';
     const uniqueId = Date.now();
     const taskFromA = `MigrateTaskA-${uniqueId}`;
-    const taskFromB = `MigrateTaskB-${uniqueId}`;
 
     await createSyncFolder(request, SYNC_FOLDER_NAME);
 
@@ -173,27 +196,33 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption — Unencrypted 
     console.log('[SetupMigrate] Phase 1: Client A (no encryption) seeds the remote');
 
     const { context: contextA, page: pageA } = await setupSyncClient(browser, url);
+    const syncFiles = trackSyncFiles(pageA, SYNC_FILE_URL);
     const syncPageA = new SyncPage(pageA);
     const workViewPageA = new WorkViewPage(pageA);
 
     await workViewPageA.waitForTaskList();
 
-    await syncPageA.setupWebdavSync({ ...WEBDAV_CONFIG }); // skips the setup dialog
-    await expect(syncPageA.syncBtn).toBeVisible();
-
     await workViewPageA.addTask(taskFromA);
     await expect(pageA.locator('task')).toHaveCount(1);
     await waitForStatePersistence(pageA);
+
+    await syncPageA.setupWebdavSync({ ...WEBDAV_CONFIG }); // skips the setup dialog
+    await expect(syncPageA.syncBtn).toBeVisible();
 
     await syncPageA.triggerSync();
     await waitForSyncComplete(pageA, syncPageA);
 
     // Baseline: the remote is genuinely UNENCRYPTED (title present in plaintext).
-    const before = await request.fetch(SYNC_FILE_URL, {
-      headers: { Authorization: AUTH_HEADER },
-    });
-    expect(before.ok()).toBeTruthy();
-    expect(await before.text()).toContain(taskFromA);
+    const beforeFiles = new Map<string, string>();
+    for (const fileUrl of syncFiles) {
+      const before = await request.fetch(fileUrl, {
+        headers: { Authorization: AUTH_HEADER },
+      });
+      expect(before.ok(), fileUrl).toBeTruthy();
+      const beforeBody = await before.text();
+      expect(beforeBody, fileUrl).toContain(taskFromA);
+      beforeFiles.set(fileUrl, beforeBody);
+    }
     console.log('[SetupMigrate] Remote seeded unencrypted (plaintext title present)');
 
     // ============ PHASE 2: Client B joins it WITH setup-time encryption ============
@@ -213,35 +242,22 @@ test.describe('@webdav @encryption WebDAV Setup-Time Encryption — Unencrypted 
     await expect(syncPageB.syncBtn).toBeVisible();
 
     await syncPageB.triggerSync();
-    await waitForSyncComplete(pageB, syncPageB);
-
-    // DATA SAFETY: B must have downloaded A's task — not overwritten the remote
-    // with its own empty state (the failure mode this test guards).
-    await expect(pageB.locator(`task:has-text("${taskFromA}")`).first()).toBeVisible();
-    console.log('[SetupMigrate] Client B preserved A data (received the task)');
-
-    // ============ PHASE 3: B writes → remote is upgraded to encrypted ============
-    await workViewPageB.addTask(taskFromB);
-    await waitForStatePersistence(pageB);
-
-    await syncPageB.triggerSync();
-    await waitForSyncComplete(pageB, syncPageB);
-
-    // The remote is now encrypted: neither title appears in plaintext anymore.
-    const after = await request.fetch(SYNC_FILE_URL, {
-      headers: { Authorization: AUTH_HEADER },
+    const downgradeError = pageB.locator('.mat-mdc-snack-bar-container', {
+      hasText: 'The synced data is not encrypted',
     });
-    expect(after.ok()).toBeTruthy();
-    const afterBody = await after.text();
-    expect(afterBody.length).toBeGreaterThan(0);
-    expect(afterBody).not.toContain(taskFromA);
-    expect(afterBody).not.toContain(taskFromB);
-    console.log('[SetupMigrate] Remote upgraded to encrypted (no plaintext titles)');
+    await expect(downgradeError).toBeVisible({ timeout: 30000 });
 
-    // B still holds both tasks (nothing lost during the upgrade).
-    await expect(pageB.locator(`task:has-text("${taskFromA}")`).first()).toBeVisible();
-    await expect(pageB.locator(`task:has-text("${taskFromB}")`).first()).toBeVisible();
-    console.log('[SetupMigrate] ✓ Data preserved and remote encrypted');
+    // FAIL CLOSED: B imports nothing and the plaintext remote remains byte-for-byte
+    // unchanged. In particular, the failed sync must not upload B's empty state.
+    await expect(pageB.locator('task')).toHaveCount(0);
+    for (const [fileUrl, beforeBody] of beforeFiles) {
+      const after = await request.fetch(fileUrl, {
+        headers: { Authorization: AUTH_HEADER },
+      });
+      expect(after.ok(), fileUrl).toBeTruthy();
+      expect(await after.text(), fileUrl).toBe(beforeBody);
+    }
+    console.log('[SetupMigrate] ✓ Plaintext remote rejected without modification');
 
     await closeContextsSafely(contextA, contextB);
   });

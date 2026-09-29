@@ -14,6 +14,29 @@ export interface PluginMenuEntryCfg {
   onClick: () => void;
 }
 
+export type PluginTaskContextMenuTarget = 'TASK' | 'SUBTASK';
+
+export interface PluginTaskContextMenuContext {
+  readonly taskId: string;
+}
+
+/**
+ * A plugin action shown in the task context menu's dedicated plugin submenu.
+ * Register from plugin.js; callback registrations are not supported in iframe
+ * index.html files.
+ */
+export interface PluginTaskContextMenuEntryCfg {
+  /** Unique within this plugin. */
+  id: string;
+  /** A non-empty action label of at most 80 characters. */
+  label: string;
+  /** Optional Material icon ligature name. Custom SVG assets are not supported. */
+  icon?: string;
+  /** Defaults to both regular tasks and subtasks when omitted; an empty array is invalid. */
+  showFor?: readonly PluginTaskContextMenuTarget[];
+  onClick: (context: PluginTaskContextMenuContext) => void | Promise<void>;
+}
+
 export enum PluginHooks {
   TASK_CREATED = 'taskCreated',
   TASK_COMPLETE = 'taskComplete',
@@ -54,6 +77,12 @@ export type DialogResult = string | undefined;
 
 export interface DialogCfg {
   title?: string;
+  /**
+   * Rich HTML sanitized by the host before rendering, rebuilt from an allowlist.
+   * Semantic HTML, native form controls and inline layout styles are preserved;
+   * scripts, event-handler attributes, unsafe URLs, inline `<svg>` and `style`
+   * values containing `url(` are removed. Escape untrusted values yourself.
+   */
   htmlContent?: string;
   content?: string;
   okBtnLabel?: string;
@@ -308,16 +337,6 @@ export interface Task {
   _hideSubTasksMode?: number;
 }
 
-export interface ProjectFolder {
-  id: string;
-  title: string;
-  icon?: string | null;
-  parentId?: string | null;
-  isExpanded?: boolean;
-  created: number;
-  updated?: number;
-}
-
 export interface Project {
   id: string;
   title: string;
@@ -334,7 +353,6 @@ export interface Project {
   noteIds: string[];
   isEnableBacklog?: boolean;
   isHiddenFromMenu?: boolean;
-  folderId?: string | null;
 
   // Advanced config (internal) - must be any to match WorkContextCommon
   advancedCfg: unknown;
@@ -527,11 +545,23 @@ export interface PluginAPI {
 
   registerMenuEntry(menuEntryCfg: Omit<PluginMenuEntryCfg, 'pluginId'>): void;
 
+  /** Register an action in the task context menu's plugin submenu. */
+  registerTaskContextMenuEntry(cfg: PluginTaskContextMenuEntryCfg): void;
+
   registerConfigHandler(handler: () => void): void;
 
   registerShortcut(
     shortcutCfg: Omit<PluginShortcutCfg, 'pluginId'> & { id?: string },
   ): void;
+
+  /**
+   * Remove a shortcut this plugin registered before, by the id it was
+   * registered with (when `id` was omitted there, that is the sanitized label).
+   * Registering the same id again replaces the existing entry, so this is only
+   * needed when a shortcut disappears for good. The user's key binding is kept
+   * in the keyboard settings, so re-registering the same id restores it.
+   */
+  unregisterShortcut(shortcutId: string): void;
 
   registerSidePanelButton(sidePanelBtnCfg: Omit<PluginSidePanelBtnCfg, 'pluginId'>): void;
 
@@ -662,6 +692,14 @@ export interface PluginAPI {
   addProject(projectData: Partial<Project>): Promise<string>;
 
   updateProject(projectId: string, updates: Partial<Project>): Promise<void>;
+
+  /**
+   * Deletes a project AND the tasks it contains, matching what the UI's own
+   * "Delete project" does — the cascade lives in ProjectService.remove().
+   * Deleting the Inbox is refused. If the deleted project is the active work
+   * context, the app falls back to Today.
+   */
+  deleteProject(projectId: string): Promise<void>;
 
   // tags
   getAllTags(): Promise<Tag[]>;

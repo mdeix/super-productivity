@@ -28,7 +28,6 @@ import {
   toggleHideFromMenu,
   unarchiveProject,
   updateProject,
-  updateProjectOrder,
 } from './store/project.actions';
 import { TaskSharedActions } from '../../root-store/meta/task-shared.actions';
 import { DEFAULT_PROJECT, INBOX_PROJECT } from './project.const';
@@ -251,6 +250,10 @@ export class ProjectService {
       const withSubTasks = await firstValueFrom(
         this._taskService.getByIdWithSubTaskData$(task.id),
       );
+      // Skip tasks that vanished from the store mid-loop (#9946).
+      if (!withSubTasks) {
+        continue;
+      }
       this._taskService.moveToProject(withSubTasks, INBOX_PROJECT.id);
       if (task.isDone) {
         this._taskService.setUnDone(task.id);
@@ -410,13 +413,18 @@ export class ProjectService {
     );
   }
 
-  update(projectId: string, changedFields: Partial<Project>): void {
+  update(
+    projectId: string,
+    changedFields: Partial<Project>,
+    isSkipSnack?: boolean,
+  ): void {
     this._store$.dispatch(
       updateProject({
         project: {
           id: projectId,
           changes: changedFields,
         },
+        isSkipSnack,
       }),
     );
   }
@@ -433,10 +441,6 @@ export class ProjectService {
 
   moveTaskToBacklog(taskId: string, projectId: string): void {
     this._store$.dispatch(moveProjectTaskToBacklogListAuto({ taskId, projectId }));
-  }
-
-  updateOrder(ids: string[]): void {
-    this._store$.dispatch(updateProjectOrder({ ids }));
   }
 
   async duplicateProject(templateProjectId: string): Promise<string> {

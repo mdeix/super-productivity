@@ -1,10 +1,11 @@
 import { TestBed } from '@angular/core/testing';
 import { of } from 'rxjs';
 import { ConflictResolutionService } from './conflict-resolution.service';
-import { ConflictJournalService } from './conflict-journal.service';
 import { Action, Store } from '@ngrx/store';
 import { OperationApplierService } from '../apply/operation-applier.service';
 import { convertOpToAction } from '../apply/operation-converter.util';
+import { OperationCaptureService } from '../capture/operation-capture.service';
+import { PersistentAction } from '../core/persistent-action.interface';
 import { OperationLogStoreService } from '../persistence/operation-log-store.service';
 import { SnackService } from '../../core/snack/snack.service';
 import { ValidateStateService } from '../validation/validate-state.service';
@@ -36,6 +37,7 @@ import { INBOX_PROJECT } from '../../features/project/project.const';
 import { TODAY_TAG } from '../../features/tag/tag.const';
 import { appStateFeatureKey } from '../../root-store/app-state/app-state.reducer';
 import { getDbDateStr } from '../../util/get-db-date-str';
+import { UnsupportedMultiEntityConflictError } from '../core/errors/sync-errors';
 
 /**
  * Minimal RootState for exercising the PRODUCTION `lwwUpdateMetaReducer` on a
@@ -74,9 +76,8 @@ const buildRootStateWithTask = (task: Record<string, unknown>): unknown => ({
 /**
  * Disjoint-field auto-merge acceptance tests.
  *
- * (a) title-vs-notes concurrent edit → merged entity keeps BOTH; journal
- *     merged/disjoint-merge/info; not in unreviewed.
- * (b) title-vs-title (same field) → LWW unchanged; journal unreviewed.
+ * (a) title-vs-notes concurrent edit → merged entity keeps BOTH.
+ * (b) title-vs-title (same field) → LWW unchanged.
  * (c) disjoint real fields + both bumped a NOISE field → still merges; noise
  *     field resolved deterministically.
  * (d) edit-vs-delete → delete wins, NO merge.
@@ -85,7 +86,6 @@ const buildRootStateWithTask = (task: Record<string, unknown>): unknown => ({
  */
 describe('ConflictResolutionService — disjoint-field merge', () => {
   let service: ConflictResolutionService;
-  let journal: ConflictJournalService;
   let mockStore: jasmine.SpyObj<Store>;
   let mockOpLogStore: jasmine.SpyObj<OperationLogStoreService>;
   let mockOperationApplier: jasmine.SpyObj<OperationApplierService>;
@@ -203,7 +203,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     });
 
     service = TestBed.inject(ConflictResolutionService);
-    journal = TestBed.inject(ConflictJournalService);
   });
 
   // ── regression: checkpoint contract vs synthetic merged ops (#8900 seam) ───
@@ -353,14 +352,154 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     expect(compareVectorClocks(merged!.vectorClock, { B: 1 })).toBe(
       VectorClockComparison.GREATER_THAN,
     );
+  });
 
-    // Journal: merged / disjoint-merge / info, and NOT counted as unreviewed.
-    const entries = await journal.list('history');
-    expect(entries.length).toBe(1);
-    expect(entries[0].winner).toBe('merged');
-    expect(entries[0].reason).toBe('disjoint-merge');
-    expect(entries[0].status).toBe('info');
-    expect((await journal.list('unreviewed')).length).toBe(0);
+  // ── (a-time) #10147 regression: pending edit vs remote syncTimeSpent ───────
+  // A syncTimeSpent op is an additive delta. Its wire entityChanges carry the
+  // delta's arguments ({ taskId, date, duration }, direct write) or nothing
+  // (deferred write); a synthesized merge would write those keys onto the task
+  // and reject the delta. The pair must fall to whole-entity LWW, and whichever
+  // side wins must leave the task's time history intact.
+  describe('(a-time) pending edit vs remote syncTimeSpent (#10147)', () => {
+    const DAY = '2024-01-15';
+    const HISTORY = {
+      ['2024-01-10']: 7200000,
+      ['2024-01-12']: 3600000,
+      [DAY]: 7200000,
+    };
+    const HISTORY_TOTAL = 18000000;
+    const currentTask = {
+      id: 'task-1',
+      title: 'T',
+      isDone: true,
+      timeSpent: HISTORY_TOTAL,
+      timeSpentOnDay: HISTORY,
+      dueWithTime: null,
+      projectId: null,
+      tagIds: [],
+      parentId: null,
+      subTaskIds: [],
+      modified: 1000,
+    };
+
+    const capturedSyncTimeSpent = (form: 'direct' | 'deferred'): Operation => {
+      const actionPayload = { taskId: 'task-1', date: DAY, duration: 60000 };
+      return op({
+        id: `remote-time-${form}`,
+        clientId: 'B',
+        vectorClock: { B: 1 },
+        timestamp: 1000,
+        actionType: ActionType.TIME_TRACKING_SYNC_TIME_SPENT,
+        payload: {
+          actionPayload,
+          entityChanges:
+            form === 'direct'
+              ? new OperationCaptureService().extractEntityChanges({
+                  type: ActionType.TIME_TRACKING_SYNC_TIME_SPENT,
+                  ...actionPayload,
+                  meta: {
+                    isPersistent: true,
+                    entityType: 'TASK',
+                    entityId: 'task-1',
+                    opType: OpType.Update,
+                  },
+                } as unknown as PersistentAction)
+              : [],
+        },
+      });
+    };
+
+    const pendingDoneEdit = (): Operation =>
+      op({
+        id: 'local-done',
+        clientId: 'A',
+        vectorClock: { A: 1 },
+        timestamp: 2000,
+        payload: { task: { id: 'task-1', changes: { isDone: true } } },
+      });
+
+    const expectNoSynthesizedMerge = async (): Promise<void> => {
+      const localOps = mockOpLogStore.appendMixedSourceBatchSkipDuplicates.calls
+        .allArgs()
+        .flatMap(([batches]) => batches)
+        .filter((batch) => batch.source === 'local')
+        .flatMap((batch) => [...batch.ops]);
+      for (const emitted of localOps) {
+        const payload = extractActionPayload(emitted.payload);
+        expect(Object.keys(payload)).not.toContain('taskId');
+        expect(Object.keys(payload)).not.toContain('date');
+        expect(Object.keys(payload)).not.toContain('duration');
+        expect((emitted.payload as { lwwUpdateMode?: string }).lwwUpdateMode).not.toBe(
+          'patch',
+        );
+      }
+    };
+
+    for (const form of ['direct', 'deferred'] as const) {
+      it(`never synthesizes a merged patch from a ${form}-form delta and keeps the time history on the local-win path`, async () => {
+        mockStore.select.and.returnValue(of(currentTask));
+
+        await service.autoResolveConflictsLWW([
+          conflictOf([pendingDoneEdit()], [capturedSyncTimeSpent(form)]),
+        ]);
+        await expectNoSynthesizedMerge();
+
+        // Local (ts 2000) wins: the local-win op is a full snapshot. Applied
+        // through the production reducer on the other client, it carries the
+        // whole timeSpentOnDay map — not a single-day delta.
+        const localWin = mergedOpArgs();
+        expect(localWin).toBeDefined();
+        const mockBase = jasmine.createSpy('base').and.callFake((st: unknown) => st);
+        const prodReducer = lwwUpdateMetaReducer(mockBase);
+        const otherClientState = buildRootStateWithTask({
+          ...currentTask,
+          isDone: false,
+          timeSpent: HISTORY_TOTAL + 60000,
+          timeSpentOnDay: { ...HISTORY, [DAY]: HISTORY[DAY] + 60000 },
+        });
+        prodReducer(
+          otherClientState,
+          convertOpToAction(
+            JSON.parse(JSON.stringify(localWin)) as Operation,
+          ) as unknown as Action,
+        );
+        const task = (
+          mockBase.calls.mostRecent().args[0] as Record<
+            string,
+            { entities: Record<string, Record<string, unknown>> }
+          >
+        )[TASK_FEATURE_NAME].entities['task-1'];
+        expect(task['isDone']).toBe(true);
+        expect(task['timeSpentOnDay']).toEqual(HISTORY);
+        expect(task['timeSpent']).toBe(HISTORY_TOTAL);
+      });
+    }
+
+    it('never synthesizes a merged patch when the pending side is a removeTimeSpent delta', async () => {
+      mockStore.select.and.returnValue(of(currentTask));
+      const localRemove = op({
+        id: 'local-remove',
+        clientId: 'A',
+        vectorClock: { A: 1 },
+        timestamp: 2000,
+        actionType: ActionType.TASK_REMOVE_TIME_SPENT,
+        payload: {
+          actionPayload: { id: 'task-1', date: DAY, duration: 60000 },
+          entityChanges: [],
+        },
+      });
+      const remoteTitle = op({
+        id: 'remote-title',
+        clientId: 'B',
+        vectorClock: { B: 1 },
+        timestamp: 1000,
+        payload: { task: { id: 'task-1', changes: { title: 'Remote' } } },
+      });
+
+      await service.autoResolveConflictsLWW([conflictOf([localRemove], [remoteTitle])]);
+
+      await expectNoSynthesizedMerge();
+    });
   });
 
   // ── (a0) #9095 regression: rename vs mark-done → merge both ────────────────
@@ -399,6 +538,90 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     const rejected = mockOpLogStore.markRejected.calls.allArgs().flat(2);
     expect(rejected).toContain('local-done');
     expect(rejected).toContain('remote-rename');
+  });
+
+  // ── (a0b) #9776 follow-up: a cleared field must survive the disjoint merge ──
+  // The clear op arrives over the wire with its undefined-valued key dropped by
+  // JSON and only the out-of-band `clearedFields` marking it. Pre-fix the
+  // receiver classified it as opaque (no merge → whole-entity LWW) while the
+  // author merged — divergent strategies for the same conflict — and even the
+  // author's merged op lost the clear on upload (no `clearedFields` on the
+  // synthesized payload).
+  it('(a0b) merges a wire-shape field clear with a disjoint edit and re-lists the clear', async () => {
+    mockStore.select.and.returnValue(
+      of({ id: 'task-1', title: 'Local title', _hideSubTasksMode: undefined }),
+    );
+
+    const localOp = op({
+      id: 'local-title',
+      clientId: 'A',
+      vectorClock: { A: 1 },
+      timestamp: 2000,
+      payload: { task: { id: 'task-1', changes: { title: 'Local title' } } },
+    });
+    // Remote clear exactly as it comes off the wire: `changes` lost the
+    // undefined-valued key to JSON serialization; `clearedFields` survives.
+    const remoteOp: Operation = JSON.parse(
+      JSON.stringify(
+        op({
+          id: 'remote-clear',
+          clientId: 'B',
+          vectorClock: { B: 1 },
+          timestamp: 1000,
+          payload: {
+            actionPayload: {
+              task: { id: 'task-1', changes: { _hideSubTasksMode: undefined } },
+              clearedFields: ['_hideSubTasksMode'],
+            },
+            entityChanges: [],
+          },
+        }),
+      ),
+    );
+
+    await service.autoResolveConflictsLWW([conflictOf([localOp], [remoteOp])]);
+
+    const merged = mergedOpArgs();
+    expect(merged).toBeDefined();
+    const payload = extractActionPayload(merged!.payload);
+    expect(payload['title']).toBe('Local title');
+    // The clear is present in the delta AND re-listed out-of-band so it
+    // survives the merged op's own JSON upload.
+    expect(Object.keys(payload)).toContain('_hideSubTasksMode');
+    expect(payload['_hideSubTasksMode']).toBeUndefined();
+    expect((merged!.payload as { clearedFields?: string[] }).clearedFields).toEqual([
+      '_hideSubTasksMode',
+    ]);
+    expect((merged!.payload as { lwwUpdateMode?: string }).lwwUpdateMode).toBe('patch');
+
+    const rejected = mockOpLogStore.markRejected.calls.allArgs().flat(2);
+    expect(rejected).toContain('local-title');
+    expect(rejected).toContain('remote-clear');
+  });
+
+  // ── (a0c) clearedFields is scoped to disjoint merges ──
+  // Other patch-mode producers build payloads from live state, where an
+  // undefined-valued key is an accident of the object literal (e.g.
+  // taskRelationshipPatch materializes `parentId: undefined` for every root
+  // task), NOT a user intent. Listing those as clears would broadcast an
+  // explicit `parentId` clear on 100% of relationship patches and force-detach
+  // concurrently-created subtask links on receivers.
+  it('(a0c) does NOT list clearedFields on non-merge patch ops with accidental undefined keys', () => {
+    const opResult = service.createLWWUpdateOp(
+      'TASK',
+      'task-1',
+      // Shape of taskRelationshipPatch for a root task: parentId materialized
+      // but undefined.
+      { id: 'task-1', projectId: 'p1', parentId: undefined, subTaskIds: ['sub-1'] },
+      'clientA',
+      { clientA: 1 },
+      1000,
+      'patch',
+    );
+
+    expect(
+      (opResult.payload as { clearedFields?: string[] }).clearedFields,
+    ).toBeUndefined();
   });
 
   it('(a1) fails closed before mutating the op log for a legacy remote bulk op', async () => {
@@ -447,13 +670,12 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
 
     await expectAsync(
       service.autoResolveConflictsLWW([conflictOf([localOp], [remoteBulkOp], 'task-2')]),
-    ).toBeRejectedWithError(/Cannot safely auto-resolve remote multi-entity operation/);
+    ).toBeRejectedWithError(UnsupportedMultiEntityConflictError);
 
     expect(mergedOpArgs('task-2')).toBeUndefined();
     expect(mockOpLogStore.appendBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.appendMixedSourceBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.markRejected).not.toHaveBeenCalled();
-    expect(await journal.list('history')).toEqual([]);
   });
 
   it('(a1 mirror) refuses disjoint merge for a legacy local bulk op', async () => {
@@ -523,15 +745,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     await service.autoResolveConflictsLWW([
       conflictOf([localBulkOp], [remoteOp], 'task-2'),
     ]);
-
-    const entries = await journal.list('history');
-    expect(entries.length).toBe(1);
-    expect(entries[0].winner).toBe('remote');
-    expect(entries[0].reason).not.toBe('disjoint-merge');
-    const timeSpentDiff = entries[0].fieldDiffs.find(
-      (diff) => diff.field === 'timeSpent',
-    );
-    expect(timeSpentDiff?.localVal).toBe(222);
 
     const localBatches = mockOpLogStore.appendMixedSourceBatchSkipDuplicates.calls
       .allArgs()
@@ -675,7 +888,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     expect(mockOpLogStore.appendBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.appendMixedSourceBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.markRejected).not.toHaveBeenCalled();
-    expect(await journal.list('history')).toEqual([]);
   });
 
   it('fails closed when a remote winner is opaque for a local bulk target', async () => {
@@ -723,7 +935,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     expect(mockOpLogStore.appendBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.appendMixedSourceBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.markRejected).not.toHaveBeenCalled();
-    expect(await journal.list('history')).toEqual([]);
   });
 
   it('does not recreate a bulk sibling deleted by a later local operation', async () => {
@@ -810,12 +1021,11 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
 
     await expectAsync(
       service.autoResolveConflictsLWW([conflictOf([localBulkOp], [remoteOp], 'task-2')]),
-    ).toBeRejectedWithError(/Cannot safely auto-resolve local multi-entity operation/);
+    ).toBeRejectedWithError(UnsupportedMultiEntityConflictError);
 
     expect(mockOpLogStore.appendBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.appendMixedSourceBatchSkipDuplicates).not.toHaveBeenCalled();
     expect(mockOpLogStore.markRejected).not.toHaveBeenCalled();
-    expect(await journal.list('history')).toEqual([]);
   });
 
   it('re-emits a decomposable local bulk sibling when the local bulk wins', async () => {
@@ -1066,17 +1276,15 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
 
     // detectConflicts emits one conflict per remote op → two conflicts, same
     // entity. Merging each independently would let the clock-dominating sibling
-    // silently drop the other's field, falsely journaled as "kept both".
+    // silently drop the other's field.
     await service.autoResolveConflictsLWW([
       conflictOf([localEst], [remoteTitle]),
       conflictOf([localEst], [remoteNotes]),
     ]);
-
-    // No merged op was synthesized; both conflicts fell back to whole-entity LWW.
-    const entries = await journal.list('history');
-    expect(entries.length).toBeGreaterThan(0);
-    expect(entries.every((e) => e.winner !== 'merged')).toBe(true);
-    expect((await journal.list('unreviewed')).length).toBeGreaterThan(0);
+    expect(mergedOpArgs()).toBeUndefined();
+    expect(mockOpLogStore.markRejected).toHaveBeenCalledWith(
+      jasmine.arrayContaining(['local-est']),
+    );
   });
 
   it('(a5) refuses disjoint-merge for a multi-entity remote operation (#8956)', async () => {
@@ -1101,10 +1309,9 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
 
     await expectAsync(
       service.autoResolveConflictsLWW([conflictOf([localOp], [remoteOp])]),
-    ).toBeRejectedWithError(/Cannot safely auto-resolve remote multi-entity operation/);
+    ).toBeRejectedWithError(UnsupportedMultiEntityConflictError);
     expect(mergedOpArgs()).toBeUndefined();
     expect(mockOpLogStore.appendMixedSourceBatchSkipDuplicates).not.toHaveBeenCalled();
-    expect(await journal.list('history')).toEqual([]);
   });
 
   // ── (a5) disjoint-merge fix: refuse merge for fallback-less entity types ───────────
@@ -1113,7 +1320,7 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     // recreate a schema-INVALID NOTE (no RECREATE_FALLBACK). So NOTE disjoint
     // conflicts must fall back to whole-entity LWW, not merge.
     mockStore.select.and.returnValue(
-      of({ id: 'note-1', content: 'base', backgroundColor: 'base' }),
+      of({ id: 'note-1', content: 'Local content', backgroundColor: 'base' }),
     );
     const localOp = op({
       id: 'local-note',
@@ -1143,17 +1350,16 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
         suggestedResolution: 'manual',
       },
     ]);
-
-    const entries = await journal.list('history');
-    expect(entries.length).toBeGreaterThan(0);
-    expect(entries.every((e) => e.winner !== 'merged')).toBe(true);
+    const replacement = mergedOpArgs('note-1');
+    expect(replacement).toBeDefined();
+    expect(extractActionPayload(replacement!.payload)['content']).toBe('Local content');
+    expect((replacement!.payload as { lwwUpdateMode?: string }).lwwUpdateMode).toBe(
+      'replace',
+    );
+    expect(mockOpLogStore.markRejected).toHaveBeenCalledWith(['remote-note']);
   });
 
-  // ── (a6) merge journaled only AFTER the merged op is durably appended ──────
-  it('(a6) does not journal a merge when appending the merged op fails', async () => {
-    // A `merged` entry claims "both sides kept" — that is only true once the
-    // merged op is persisted. If the append throws, the journal must not
-    // contain a phantom merge (STEP 3b journals post-append, not at plan time).
+  it('(a6) aborts resolution when appending the merged op fails', async () => {
     mockStore.select.and.returnValue(
       of({ id: 'task-1', title: 'Local title', notes: 'base' }),
     );
@@ -1179,13 +1385,11 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     await expectAsync(
       service.autoResolveConflictsLWW([conflictOf([localOp], [remoteOp])]),
     ).toBeRejected();
-
-    const history = await journal.list('history');
-    expect(history.filter((e) => e.winner === 'merged')).toEqual([]);
+    expect(mockOperationApplier.applyOperations).not.toHaveBeenCalled();
   });
 
   // ── (b) title vs title → LWW unchanged ─────────────────────────────────────
-  it('(b) leaves same-field (title-vs-title) conflicts to LWW (journal unreviewed)', async () => {
+  it('(b) leaves same-field (title-vs-title) conflicts to LWW', async () => {
     mockStore.select.and.returnValue(of({ id: 'task-1', title: 'Local title' }));
 
     const localOp = op({
@@ -1204,13 +1408,13 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     });
 
     await service.autoResolveConflictsLWW([conflictOf([localOp], [remoteOp])]);
-
-    const entries = await journal.list('history');
-    expect(entries.length).toBe(1);
-    expect(entries[0].reason).toBe('newer'); // local ts newer, same field
-    expect(entries[0].winner).toBe('local');
-    expect(entries[0].status).toBe('unreviewed');
-    expect((await journal.list('unreviewed')).length).toBe(1);
+    const replacement = mergedOpArgs();
+    expect(replacement).toBeDefined();
+    expect(extractActionPayload(replacement!.payload)['title']).toBe('Local title');
+    expect((replacement!.payload as { lwwUpdateMode?: string }).lwwUpdateMode).toBe(
+      'replace',
+    );
+    expect(mockOpLogStore.markRejected).toHaveBeenCalledWith(['remote-1']);
   });
 
   // ── (c) disjoint real fields + both bumped a noise field → still merges ─────
@@ -1248,10 +1452,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     // The noise field resolves to the greater-(timestamp) side, NOT simply the
     // local current-state value.
     expect(payload['modified']).toBe(2222);
-
-    const entries = await journal.list('history');
-    expect(entries[0].reason).toBe('disjoint-merge');
-    expect(entries[0].status).toBe('info');
   });
 
   // ── (d) edit vs delete → delete wins, NO merge ─────────────────────────────
@@ -1283,11 +1483,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
     ).toBe(false);
 
     await service.autoResolveConflictsLWW([conflictOf([localOp], [remoteDelete])]);
-
-    const entries = await journal.list('history');
-    expect(entries.length).toBe(1);
-    expect(entries[0].reason).toBe('delete-wins');
-    expect(entries[0].reason).not.toBe('disjoint-merge');
     // No synthesized merged UPDATE op was created for this entity.
     expect(mergedOpArgs()).toBeUndefined();
   });
@@ -1332,12 +1527,6 @@ describe('ConflictResolutionService — disjoint-field merge', () => {
 
     // No synthesized merged UPDATE op — the archive wins the WHOLE entity.
     expect(mergedOpArgs()).toBeUndefined();
-
-    const entries = await journal.list('history');
-    expect(entries.length).toBe(1);
-    expect(entries[0].reason).toBe('delete-wins');
-    expect(entries[0].reason).not.toBe('disjoint-merge');
-    expect(entries[0].winner).toBe('remote');
   });
 
   // ── (e) two-client convergence ─────────────────────────────────────────────

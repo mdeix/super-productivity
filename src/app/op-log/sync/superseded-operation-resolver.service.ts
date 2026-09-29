@@ -4,10 +4,15 @@ import {
   ActionType,
   isLwwUpdatePayload,
   Operation,
+  OperationLogEntry,
   OpType,
   VectorClock,
 } from '../core/operation.types';
-import { mergeVectorClocks } from '../../core/util/vector-clock';
+import {
+  compareVectorClocks,
+  mergeVectorClocks,
+  VectorClockComparison,
+} from '../../core/util/vector-clock';
 import { OpLog } from '../../core/log';
 import {
   ConflictResolutionService,
@@ -18,11 +23,98 @@ import { LockService } from './lock.service';
 import { toEntityKey } from '../util/entity-key.util';
 import { LOCK_NAMES } from '../core/operation-log.const';
 import { SnackService } from '../../core/snack/snack.service';
-import { SyncConflictBannerService } from './sync-conflict-banner.service';
 import { T } from '../../t.const';
 import { CLIENT_ID_PROVIDER } from '../util/client-id.provider';
 import { uuidv7 } from '../../util/uuid-v7';
 import { CURRENT_SCHEMA_VERSION } from '../persistence/schema-migration.service';
+import {
+  areCommutingSectionOperations,
+  projectSectionReplayAgainstState,
+  SectionReplayOrder,
+  SectionReplayStateCompensation,
+} from './section-conflict-commutativity.util';
+import { getOpEntityIds } from '../util/get-op-entity-ids.util';
+import { StateSnapshotService } from '../backup/state-snapshot.service';
+import { OperationCaptureService } from '../capture/operation-capture.service';
+import { getPhantomChangeRisk } from '../capture/phantom-change-guard.util';
+import { SectionState } from '../../features/section/section.model';
+import { ProjectState } from '../../features/project/project.model';
+import { TagState } from '../../features/tag/tag.model';
+import { Task } from '../../features/tasks/task.model';
+import {
+  areCommutingReorderAndContentOperations,
+  isContentReorderOperation,
+  isReorderConflictOperation,
+  projectReorderConflictAgainstState,
+  ReorderReplaySnapshot,
+} from './reorder-conflict.util';
+import { UnsupportedMultiEntityConflictError } from '../core/errors/sync-errors';
+
+type SupersededOperation = {
+  opId: string;
+  op: Operation;
+  existingClock?: VectorClock;
+};
+
+type SectionCausalReplayDecision = 'replay' | 'fallback';
+type WorkContextStateProjection = SectionReplayStateCompensation;
+interface OrderedSectionReplacement {
+  operation: Operation;
+  order: SectionReplayOrder;
+  originalIndex: number;
+}
+
+interface SectionCausalReplayContext {
+  retainedByEntityClock: Map<string, OperationLogEntry[]>;
+}
+
+const CAUSALLY_REPLAYABLE_SECTION_ACTIONS = new Set<ActionType>([
+  ActionType.SECTION_UPDATE_ORDER,
+  ActionType.SECTION_ADD_TASK,
+  ActionType.SECTION_REMOVE_TASK,
+]);
+
+const getEntityClockIndexKey = (
+  entityType: Operation['entityType'],
+  entityId: string,
+  vectorClock: VectorClock,
+): string =>
+  JSON.stringify([
+    entityType,
+    entityId,
+    Object.entries(vectorClock).sort(([first], [second]) => first.localeCompare(second)),
+  ]);
+
+const addToIndex = (
+  index: Map<string, OperationLogEntry[]>,
+  key: string,
+  entry: OperationLogEntry,
+): void => {
+  const entries = index.get(key);
+  if (entries) {
+    entries.push(entry);
+  } else {
+    index.set(key, [entry]);
+  }
+};
+
+const buildSectionCausalReplayContext = (
+  retainedEntries: OperationLogEntry[],
+): SectionCausalReplayContext => {
+  const retainedByEntityClock = new Map<string, OperationLogEntry[]>();
+
+  for (const entry of retainedEntries) {
+    for (const entityId of getOpEntityIds(entry.op)) {
+      addToIndex(
+        retainedByEntityClock,
+        getEntityClockIndexKey(entry.op.entityType, entityId, entry.op.vectorClock),
+        entry,
+      );
+    }
+  }
+
+  return { retainedByEntityClock };
+};
 
 /**
  * Resolves superseded local operations that were rejected due to concurrent modification.
@@ -50,8 +142,9 @@ export class SupersededOperationResolverService {
   private conflictResolutionService = inject(ConflictResolutionService);
   private lockService = inject(LockService);
   private snackService = inject(SnackService);
-  private syncConflictBanner = inject(SyncConflictBannerService);
   private clientIdProvider = inject(CLIENT_ID_PROVIDER);
+  private stateSnapshotService = inject(StateSnapshotService);
+  private operationCapture = inject(OperationCaptureService);
 
   /**
    * Re-creates an operation with a merged vector clock, preserving its original payload.
@@ -79,6 +172,113 @@ export class SupersededOperationResolverService {
   }
 
   /**
+   * Re-creates a superseded `restoreTask` as a `restoreTask` projected from live
+   * state (the task and its current subtasks), so remote edits applied since
+   * the restore ride along. An LWW Update would recreate the task on receivers
+   * without the archive cleanup only the semantic restore triggers, leaving a
+   * stale archived copy next to the active task (#10196).
+   */
+  private async _createLiveRestoreOp(
+    sourceOp: Operation,
+    liveTask: Task,
+    vectorClock: VectorClock,
+    clientId: string,
+  ): Promise<Operation> {
+    const subTasks: Task[] = [];
+    for (const subTaskId of liveTask.subTaskIds ?? []) {
+      const subTask = await this.conflictResolutionService.getCurrentEntityState(
+        'TASK',
+        subTaskId,
+      );
+      if (subTask) {
+        subTasks.push(subTask as Task);
+      }
+    }
+    // Scheduling is already materialized in liveTask. Replaying the original
+    // restoreToToday would undo later Planner moves, whose PLANNER ops do not
+    // share this restore's TASK conflict group.
+    const actionPayload = { task: liveTask, subTasks };
+    return this._recreateOpWithMergedClock(
+      { ...sourceOp, payload: { actionPayload, entityChanges: [] } },
+      vectorClock,
+      clientId,
+      sourceOp.timestamp,
+    );
+  }
+
+  private _getSectionCausalReplayDecision(
+    item: SupersededOperation,
+    context: SectionCausalReplayContext,
+  ): SectionCausalReplayDecision {
+    const existingClock = item.existingClock;
+    if (
+      (!CAUSALLY_REPLAYABLE_SECTION_ACTIONS.has(item.op.actionType) &&
+        !isReorderConflictOperation(item.op)) ||
+      !existingClock ||
+      compareVectorClocks(item.op.vectorClock, existingClock) !==
+        VectorClockComparison.CONCURRENT
+    ) {
+      return 'fallback';
+    }
+
+    const itemEntityIds = getOpEntityIds(item.op);
+    const matchingRetainedEntriesById = new Map<string, OperationLogEntry>();
+    for (const entityId of itemEntityIds) {
+      const indexKey = getEntityClockIndexKey(
+        item.op.entityType,
+        entityId,
+        existingClock,
+      );
+      for (const entry of context.retainedByEntityClock.get(indexKey) ?? []) {
+        if (entry.op.id !== item.op.id) {
+          matchingRetainedEntriesById.set(entry.op.id, entry);
+        }
+      }
+    }
+    const matchingRetainedEntries = Array.from(matchingRetainedEntriesById.values());
+    if (matchingRetainedEntries.length !== 1) {
+      return 'fallback';
+    }
+    const retainedConflictEntry = matchingRetainedEntries[0];
+    if (
+      retainedConflictEntry.source !== 'remote' ||
+      retainedConflictEntry.syncedAt === undefined ||
+      retainedConflictEntry.applicationStatus !== 'applied' ||
+      retainedConflictEntry.rejectedAt !== undefined ||
+      retainedConflictEntry.reducerRejectedAt !== undefined ||
+      (!areCommutingSectionOperations(item.op, retainedConflictEntry.op) &&
+        !areCommutingReorderAndContentOperations(item.op, retainedConflictEntry.op))
+    ) {
+      return 'fallback';
+    }
+
+    return 'replay';
+  }
+
+  /**
+   * Reads a reducer-state frontier that is fully represented by durable ops.
+   * This check and the synchronous snapshot read deliberately have no await
+   * between them. Later user actions wait behind the operation-log lock for
+   * persistence and therefore follow the compensation in durable order.
+   */
+  private _getStableSectionReplaySnapshot(): ReorderReplaySnapshot {
+    const phantomRisk = getPhantomChangeRisk(this.operationCapture);
+    if (phantomRisk) {
+      throw new Error(`Cannot project SECTION conflict recovery while ${phantomRisk}.`);
+    }
+    const snapshot = this.stateSnapshotService.getStateSnapshotForOperationLog();
+    return {
+      section: snapshot.section as SectionState,
+      project: snapshot.project as ProjectState,
+      tag: snapshot.tag as TagState,
+      note: snapshot.note as ReorderReplaySnapshot['note'],
+      simpleCounter: snapshot.simpleCounter as ReorderReplaySnapshot['simpleCounter'],
+      boards: snapshot.boards as ReorderReplaySnapshot['boards'],
+      issueProvider: snapshot.issueProvider as ReorderReplaySnapshot['issueProvider'],
+    };
+  }
+
+  /**
    * Resolves superseded local operations by creating new LWW Update operations.
    *
    * @param supersededOps - Operations that were rejected due to concurrent modification
@@ -87,7 +287,7 @@ export class SupersededOperationResolverService {
    * @returns Number of merged ops created
    */
   async resolveSupersededLocalOps(
-    supersededOps: Array<{ opId: string; op: Operation; existingClock?: VectorClock }>,
+    supersededOps: SupersededOperation[],
     extraClocks?: VectorClock[],
     snapshotVectorClock?: VectorClock,
   ): Promise<number> {
@@ -131,54 +331,181 @@ export class SupersededOperationResolverService {
       const opsToReject: string[] = [];
       const newOpsCreated: Operation[] = [];
       const auxiliaryOpIds = new Set<string>();
+      const orderedSectionReplacements: OrderedSectionReplacement[] = [];
 
-      // Handle bulk semantic operations BEFORE entity-by-entity grouping.
+      // Handle irreducible semantic operations BEFORE entity-by-entity grouping.
       // moveToArchive uses OpType.Update but its reducer removes entities from the NgRx store
       // (via deleteTaskHelper). This is the ONLY action with this pattern — all other entity
       // removals use OpType.Delete (handled below). The normal resolution path would call
       // getCurrentEntityState() → undefined → discard, permanently losing the archive.
       // Instead, re-create the operation with a merged clock preserving the original payload.
-      // NOTE: If a future action type also removes entities with OpType.Update, add it here.
-      const regularSupersededOps: Array<{
-        opId: string;
-        op: Operation;
-        existingClock?: VectorClock;
-      }> = [];
-      for (const item of supersededOps) {
-        if (item.op.actionType === ActionType.TASK_SHARED_MOVE_TO_ARCHIVE) {
-          // Re-create the archive operation with a merged vector clock.
-          // The original payload is preserved exactly (MultiEntityPayload format with
-          // actionPayload.tasks containing full task data for remote archive writes).
+      //
+      // SECTION order/placement operations also carry reducer semantics that an
+      // entity snapshot cannot represent. Re-create one only when the exact
+      // applied server row proves a commuting crossing. Project its payload
+      // against one stable live-state frontier so anchors and every later local
+      // successor are represented without an action-family allowlist. A recognized
+      // reorder without this proof must stay pending: entity LWW cannot carry it.
+      // Absolute habit counts are projected without the proof (see below).
+      const regularSupersededOps: SupersededOperation[] = [];
+      let sectionReplayContext: SectionCausalReplayContext | undefined;
+      let sectionReplaySnapshot: ReorderReplaySnapshot | undefined;
+      for (const [itemIndex, item] of supersededOps.entries()) {
+        let projectedSectionOp: Operation | undefined;
+        let projectedWorkContextState: WorkContextStateProjection | undefined;
+        let projectedOrder: SectionReplayOrder | undefined;
+        // An absolute dated count needs no causal proof: reissuing its
+        // current value is a local no-op and, unlike a whole-habit LWW snapshot,
+        // leaves every other field (and released receivers' SimpleCounter.type)
+        // alone. Stopping sync for it would block habit clicks.
+        const isCounterSet =
+          item.op.actionType === ActionType.COUNTER_SET_TODAY ||
+          item.op.actionType === ActionType.COUNTER_SET_FOR_DATE;
+        if (
+          isCounterSet ||
+          ((CAUSALLY_REPLAYABLE_SECTION_ACTIONS.has(item.op.actionType) ||
+            isReorderConflictOperation(item.op)) &&
+            item.existingClock)
+        ) {
+          let replayDecision: SectionCausalReplayDecision = 'replay';
+          if (!isCounterSet) {
+            sectionReplayContext ??= buildSectionCausalReplayContext(
+              await this.opLogStore.getOpsAfterSeq(0),
+            );
+            replayDecision = this._getSectionCausalReplayDecision(
+              item,
+              sectionReplayContext,
+            );
+          }
+          if (replayDecision === 'replay') {
+            sectionReplaySnapshot ??= this._getStableSectionReplaySnapshot();
+            const projection = isReorderConflictOperation(item.op)
+              ? projectReorderConflictAgainstState(item.op, sectionReplaySnapshot)
+              : projectSectionReplayAgainstState(item.op, sectionReplaySnapshot);
+            if (projection.kind === 'superseded') {
+              opsToReject.push(item.opId);
+              OpLog.normal(
+                `SupersededOperationResolverService: Replayable intent ${item.opId} ` +
+                  'was superseded by the current durable state.',
+              );
+              continue;
+            }
+            if (projection.kind === 'blocked') {
+              OpLog.warn(
+                `SupersededOperationResolverService: Cannot safely project SECTION ` +
+                  `intent ${item.opId}: ${projection.reason}.`,
+              );
+            } else if (projection.kind === 'work-context-state') {
+              projectedWorkContextState = projection;
+            } else {
+              projectedSectionOp = projection.operation;
+              projectedOrder = projection.order;
+              projectedWorkContextState = projection.stateCompensation;
+            }
+          }
+        }
+
+        // Compaction can remove the applied conflict row while retaining the
+        // unsynced reorder. Entity LWW cannot carry that list write: keep it pending.
+        if (
+          isContentReorderOperation(item.op) &&
+          !projectedSectionOp &&
+          !projectedWorkContextState
+        ) {
+          throw new UnsupportedMultiEntityConflictError(
+            'local',
+            item.op.actionType,
+            getOpEntityIds(item.op).length,
+          );
+        }
+
+        if (
+          item.op.actionType === ActionType.TASK_SHARED_MOVE_TO_ARCHIVE ||
+          projectedSectionOp ||
+          projectedWorkContextState
+        ) {
+          const clocksToMerge = [globalClock, item.op.vectorClock];
+          if ((projectedSectionOp || projectedWorkContextState) && item.existingClock) {
+            clocksToMerge.push(item.existingClock);
+          }
           const mergedClock = this.conflictResolutionService.mergeAndIncrementClocks(
-            [globalClock, item.op.vectorClock],
+            clocksToMerge,
             clientId,
           );
           // Don't prune here — the server prunes AFTER conflict detection (before storage).
           // Client-side pruning would drop entity clock IDs when the merged clock exceeds
           // MAX_VECTOR_CLOCK_SIZE, causing the comparison to return CONCURRENT instead of
           // GREATER_THAN → infinite rejection loop.
-          const newOp = this._recreateOpWithMergedClock(
-            item.op,
-            mergedClock,
-            clientId,
-            item.op.timestamp,
-          );
-          newOpsCreated.push(newOp);
+          const replacements: Array<{
+            operation: Operation;
+            order: SectionReplayOrder | undefined;
+          }> = [];
+          if (projectedSectionOp) {
+            replacements.push({
+              operation: this._recreateOpWithMergedClock(
+                projectedSectionOp,
+                mergedClock,
+                clientId,
+                item.op.timestamp,
+              ),
+              order: projectedOrder,
+            });
+          }
+          if (projectedWorkContextState) {
+            replacements.push({
+              operation: this.conflictResolutionService.createLWWUpdateOp(
+                projectedWorkContextState.entityType,
+                projectedWorkContextState.entityId,
+                projectedWorkContextState.entityState,
+                clientId,
+                mergedClock,
+                item.op.timestamp,
+                'replace',
+              ),
+              order: projectedWorkContextState.order,
+            });
+          }
+          if (replacements.length === 0) {
+            replacements.push({
+              operation: this._recreateOpWithMergedClock(
+                item.op,
+                mergedClock,
+                clientId,
+                item.op.timestamp,
+              ),
+              order: undefined,
+            });
+          }
+          for (const { operation, order } of replacements) {
+            if (order) {
+              orderedSectionReplacements.push({
+                operation,
+                order,
+                originalIndex: itemIndex,
+              });
+            } else {
+              newOpsCreated.push(operation);
+            }
+            OpLog.normal(
+              `SupersededOperationResolverService: Created causal replacement ` +
+                `${operation.actionType} op ${operation.id}, replacing superseded op ${item.opId}`,
+            );
+          }
           opsToReject.push(item.opId);
-          OpLog.normal(
-            `SupersededOperationResolverService: Created replacement moveToArchive op ${newOp.id} ` +
-              `with ${item.op.entityIds?.length ?? 0} tasks, replacing superseded op ${item.opId}`,
-          );
         } else {
           regularSupersededOps.push(item);
         }
       }
+      orderedSectionReplacements.sort(
+        (first, second) =>
+          first.order.scope.localeCompare(second.order.scope) ||
+          first.order.position - second.order.position ||
+          first.originalIndex - second.originalIndex,
+      );
+      newOpsCreated.push(...orderedSectionReplacements.map(({ operation }) => operation));
 
       // Group remaining ops by entity to handle multiple ops for the same entity
-      const opsByEntity = new Map<
-        string,
-        Array<{ opId: string; op: Operation; existingClock?: VectorClock }>
-      >();
+      const opsByEntity = new Map<string, SupersededOperation[]>();
       for (const item of regularSupersededOps) {
         // Skip ops without entityId (shouldn't happen for entity-level ops)
         if (!item.op.entityId) {
@@ -250,6 +577,29 @@ export class SupersededOperationResolverService {
           continue;
         }
 
+        // Only a SOLE restore keeps its semantic type: a restore is a no-op on
+        // receivers where the task is already active, so it could not carry
+        // later edits of the same task there — those keep the LWW snapshot.
+        if (
+          entityOps.length === 1 &&
+          firstOp.actionType === ActionType.TASK_SHARED_RESTORE &&
+          entityType === 'TASK'
+        ) {
+          const restoreOp = await this._createLiveRestoreOp(
+            firstOp,
+            entityState as Task,
+            mergedClock,
+            clientId,
+          );
+          newOpsCreated.push(restoreOp);
+          opsToReject.push(entityOps[0].opId);
+          OpLog.normal(
+            `SupersededOperationResolverService: Created replacement restoreTask op ` +
+              `${restoreOp.id} for ${entityKey}, replacing superseded op ${entityOps[0].opId}`,
+          );
+          continue;
+        }
+
         // Preserve the maximum timestamp from the superseded ops being replaced.
         // This is critical for LWW conflict resolution: if we use Date.now(), the new op
         // would have a later timestamp than the original user action, causing it to
@@ -306,32 +656,22 @@ export class SupersededOperationResolverService {
         );
       }
 
-      // Persist every replacement group atomically and rebase its clocks in
-      // durable sequence order. Retire the stale rows only afterwards: if the
-      // batch fails, the originals remain retryable; if rejection fails, the
-      // complete replacement group is already durable.
-      if (newOpsCreated.length > 0) {
-        const { written } = await this.opLogStore.appendMixedSourceBatchSkipDuplicates([
-          { ops: newOpsCreated, source: 'local' },
-        ]);
+      // Persist replacements, rebase their clocks, and retire their stale
+      // predecessors in one transaction. A crash can therefore expose neither
+      // half of the recovery on its own.
+      if (newOpsCreated.length > 0 || opsToReject.length > 0) {
+        const { written } = await this.opLogStore.appendMixedSourceBatchSkipDuplicates(
+          [{ ops: newOpsCreated, source: 'local' }],
+          { rejectOpIds: opsToReject },
+        );
         for (const { op } of written) {
           OpLog.normal(
             `SupersededOperationResolverService: Appended LWW update op ${op.id} for ${op.entityType}:${op.entityId}`,
           );
         }
-      }
-
-      if (opsToReject.length > 0) {
-        await this.opLogStore.markRejected(opsToReject);
         OpLog.normal(
           `SupersededOperationResolverService: Marked ${opsToReject.length} superseded ops as rejected`,
         );
-      }
-
-      if (newOpsCreated.length > 0) {
-        // SPAP-15: surface via the journal-driven summary banner (with REVIEW)
-        // instead of a bare snack.
-        await this.syncConflictBanner.maybeShowSummaryBanner();
       }
 
       // Notify user if local changes were discarded because entities no longer exist

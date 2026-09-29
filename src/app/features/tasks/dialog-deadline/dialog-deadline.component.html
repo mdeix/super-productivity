@@ -8,7 +8,6 @@
       [minDate]="minDate"
       [timeLabel]="T.F.TASK.D_DEADLINE.ADD_TIME | translate"
       [reminderLabel]="T.F.TASK.D_DEADLINE.REMIND_AT"
-      [quickAccessTranslationPrefix]="'F.TASK.D_DEADLINE'"
       (dateSelected)="dateSelected($event)"
       (timeChanged)="selectedTime = $event"
       (reminderChanged)="selectedReminderCfgId = $event"
@@ -17,8 +16,15 @@
     ></datetime-picker>
   }
 
-  <mat-dialog-actions align="start">
-    <div class="deadline-actions">
+  <div class="dialog-actions-and-warnings">
+    <mat-dialog-actions align="end">
+      <button
+        mat-button
+        (click)="close()"
+        type="button"
+      >
+        <span class="action-label">{{ T.G.CANCEL | translate }}</span>
+      </button>
       @if (hasExistingDeadline && !data.isSelectDeadlineOnly) {
         <button
           (click)="remove()"
@@ -27,7 +33,9 @@
           type="button"
         >
           <mat-icon>event_busy</mat-icon>
-          {{ T.F.TASK.D_DEADLINE.REMOVE_DEADLINE | translate }}
+          <span class="action-label">
+            {{ T.F.TASK.D_DEADLINE.REMOVE_DEADLINE | translate }}
+          </span>
         </button>
       }
       <button
@@ -38,16 +46,10 @@
         type="button"
       >
         <mat-icon>event_available</mat-icon>
-        {{ T.F.TASK.D_DEADLINE.SET_DEADLINE | translate }}
+        <span class="action-label">
+          {{ T.F.TASK.D_DEADLINE.SET_DEADLINE | translate }}
+        </span>
       </button>
-    </div>
-    <button
-      class="dialog-cancel-btn"
-      mat-button
-      (click)="close()"
-      type="button"
-    >
-      {{ T.G.CANCEL | translate }}
-    </button>
-  </mat-dialog-actions>
+    </mat-dialog-actions>
+  </div>
 </mat-dialog-content>

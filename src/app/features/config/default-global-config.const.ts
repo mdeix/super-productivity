@@ -31,7 +31,6 @@ export const DEFAULT_GLOBAL_CONFIG: GlobalConfigState = {
     isSyncIconEnabled: true,
     isSearchEnabled: true,
     isDonatePageEnabled: true,
-    isEnableUserProfiles: false,
     isHabitsEnabled: true,
     isFinishDayEnabled: true,
   },
@@ -60,7 +59,10 @@ export const DEFAULT_GLOBAL_CONFIG: GlobalConfigState = {
     startOfNextDayTime: '00:00',
     isDisableAnimations: false,
     isVerticalActionBar: false,
-    isDisableCelebration: false,
+    // Confetti is attention-grabbing, so it ships off and stays opt-in
+    // (product principle: less noise, more depth). Existing installs keep
+    // their persisted value.
+    isDisableCelebration: true,
     // NOTE: isUseCustomWindowTitleBar is intentionally NOT defaulted here. A
     // persisted default would be pushed to Electron on every launch and override
     // a legacy `isUseObsidianStyleHeader` choice. Its effective default is resolved
@@ -76,6 +78,7 @@ export const DEFAULT_GLOBAL_CONFIG: GlobalConfigState = {
   shortSyntax: {
     isEnableProject: true,
     isEnableDue: true,
+    isEnableDeadline: false,
     isEnableTag: true,
     urlBehavior: 'keep',
   },
@@ -174,6 +177,7 @@ export const DEFAULT_GLOBAL_CONFIG: GlobalConfigState = {
     taskUnschedule: 'U',
     taskToggleDone: 'D',
     taskAddSubTask: 'A',
+    taskDuplicate: 'Ctrl+D',
     taskAddAttachment: 'L',
     taskDelete: 'Backspace',
     taskMoveToProject: 'E',
@@ -189,6 +193,7 @@ export const DEFAULT_GLOBAL_CONFIG: GlobalConfigState = {
     collapseSubTasks: null,
     togglePlay: 'Y',
     taskEditTags: 'G',
+    taskToggleSelect: 'X',
   },
   localBackup: {
     isEnabled: true,
@@ -235,8 +240,7 @@ export const DEFAULT_GLOBAL_CONFIG: GlobalConfigState = {
     // TODO maybe enable later if it works well
     isCompressionEnabled: false,
     isEncryptionEnabled: false,
-    // SPAP-11: opt-in split-file ("Surgical") sync. Default OFF (single-file v2).
-    isUseSplitSyncFiles: false,
+    // Leave isUseSplitSyncFiles absent: discover the remote format; create v3 if empty.
     encryptKey: null,
     syncProvider: null,
     syncInterval: minute,

@@ -12,7 +12,7 @@ import {
   ScheduleLunchBreakCfg,
   ScheduleWorkStartEndCfg,
 } from '../schedule.model';
-import { selectTaskRepeatCfgsForExactDay } from '../../task-repeat-cfg/store/task-repeat-cfg.selectors';
+import { getTaskRepeatCfgsForExactDayCached } from '../../task-repeat-cfg/store/get-task-repeat-cfgs-for-exact-day-cached.util';
 import { isSameDay } from '../../../util/is-same-day';
 import { getDbDateStr } from '../../../util/get-db-date-str';
 const PROJECTION_DAYS: number = 30;
@@ -91,11 +91,9 @@ const createBlockerBlocksForScheduledRepeatProjections = (
     const currentDayTimestamp = targetDate.getTime();
     const currentDayStr = getDbDateStr(currentDayTimestamp);
 
-    const allRepeatableTasksForDay = selectTaskRepeatCfgsForExactDay.projector(
+    const allRepeatableTasksForDay = getTaskRepeatCfgsForExactDayCached(
       scheduledTaskRepeatCfgs,
-      {
-        dayDate: currentDayTimestamp,
-      },
+      currentDayTimestamp,
     );
     i++;
 
@@ -118,6 +116,7 @@ const createBlockerBlocksForScheduledRepeatProjections = (
             data: repeatCfg,
             start,
             end,
+            sourceOccurrenceDate: currentDayStr,
           },
         ],
       });
@@ -135,6 +134,20 @@ const createBlockerBlocksForWorkStartEnd = (
   const blockedBlocks: BlockedBlock[] = [];
 
   if (!workStartEndCfg) {
+    return blockedBlocks;
+  }
+  // Same corrupt-data class as the repeat-cfg guard above (#7067): the schedule
+  // config is taken verbatim from an imported/synced snapshot -- `loadAllData`
+  // spreads `globalConfig` over the defaults at the top level only, so unlike
+  // `misc`/`tasks`/... the `schedule` section gets no per-field defaulting, and
+  // typia accepts '' for a `string` so autoFixTypiaErrors never repairs it.
+  // Without this, a single bad value throws on every Schedule panel open,
+  // permanently (#5358, #4842). Reported once here rather than per day.
+  if (
+    !isValidSplitTime(workStartEndCfg.startTime) ||
+    !isValidSplitTime(workStartEndCfg.endTime)
+  ) {
+    devError('Timeline: Invalid work start/end time in schedule config');
     return blockedBlocks;
   }
   let i: number = 0;
@@ -182,6 +195,13 @@ const createBlockerBlocksForLunchBreak = (
   const blockedBlocks: BlockedBlock[] = [];
 
   if (!lunchBreakCfg) {
+    return blockedBlocks;
+  }
+  if (
+    !isValidSplitTime(lunchBreakCfg.startTime) ||
+    !isValidSplitTime(lunchBreakCfg.endTime)
+  ) {
+    devError('Timeline: Invalid lunch break time in schedule config');
     return blockedBlocks;
   }
   let i: number = 0;

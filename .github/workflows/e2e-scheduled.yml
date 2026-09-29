@@ -16,12 +16,38 @@ on:
         required: false
         type: string
         default: '@webdav'
+      webdav_format:
+        description: 'Format for generic WebDAV tests (explicit per-case formats are preserved)'
+        required: false
+        type: choice
+        default: v2
+        options:
+          - v2
+          - v3
+      run_webdav:
+        description: 'Run the WebDAV job (uncheck to skip it instead of passing a no-match grep)'
+        required: false
+        type: boolean
+        default: true
 
   push:
     branches: [master, release/*]
     paths:
       - 'src/app/imex/sync/**'
       - 'src/app/op-log/**'
+      - 'src/app/pfapi/**'
+      - 'src/app/root-store/**'
+      - 'src/app/features/*/store/**'
+      - 'src/app/features/tasks/task-attachment/**'
+      - 'src/app/plugins/store/**'
+      - 'src/app/core/date/date.service.ts'
+      - 'src/app/core/util/**'
+      - 'src/app/util/get-db-date-str.ts'
+      - 'src/app/util/is-today.util.ts'
+      - 'src/app/util/start-of-next-day.util.ts'
+      - 'src/app/util/local-actions.token.ts'
+      - 'src/app/util/skip-during-sync*.operator.ts'
+      - 'src/app/util/wait-for-sync-window.operator.ts'
       - 'e2e/tests/**'
       - 'docker-compose.yaml'
       - 'docker-compose.supersync.yaml'
@@ -45,7 +71,7 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
 
@@ -81,7 +107,7 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
 
@@ -107,8 +133,12 @@ jobs:
 
   # Job 2: WebDAV E2E tests
   e2e-webdav:
-    name: E2E Tests (WebDAV)
+    name: E2E Tests (WebDAV ${{ inputs.webdav_format || 'v2' }})
     needs: [build]
+    # Skip the job outright rather than handing it a no-match grep: Playwright
+    # exits 1 on "No tests found", which reds the whole run. `inputs` is empty
+    # for schedule/push, so gate on the event first.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_webdav }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -117,7 +147,7 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
 
@@ -149,13 +179,14 @@ jobs:
       - name: Run WebDAV E2E Tests
         env:
           E2E_REQUIRE_WEBDAV: 'true'
+          E2E_WEBDAV_FORMAT: ${{ inputs.webdav_format || 'v2' }}
         run: npm run e2e:all -- --grep "${{ inputs.webdav_grep || '@webdav' }}"
 
       - name: Print Docker Logs on Failure
         if: ${{ failure() }}
         run: |
-          echo "=== WebDAV Logs ==="
-          docker compose logs webdav
+          echo "=== WebDAV Logs (last 400 lines) ==="
+          docker compose logs --tail=400 webdav
 
       - name: Stop Docker Services
         if: always()
@@ -187,7 +218,7 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
 
@@ -229,8 +260,19 @@ jobs:
       - name: Print Docker Logs on Failure
         if: ${{ failure() }}
         run: |
-          echo "=== SuperSync Logs ==="
-          docker compose -f docker-compose.yaml -f docker-compose.supersync.yaml logs supersync webdav
+          # Bounded on purpose: the container runs with NODE_ENV=development, so Prisma
+          # logs every query. An unbounded dump was ~13k lines and pushed the Playwright
+          # failure out of the log tail the GitHub API and `gh run view --log-failed`
+          # return, leaving the actual failure unreadable.
+          echo "=== SuperSync Logs (last 400 lines per container) ==="
+          docker compose -f docker-compose.yaml -f docker-compose.supersync.yaml logs --tail=400 supersync webdav
+          # The tail above is mostly Prisma query noise; a transaction failure
+          # (e.g. "Transaction serialization failure for user ...") can sit
+          # minutes before the end and never make the cut. Surface every
+          # server WARN/ERROR separately so the failing request is nameable.
+          echo "=== SuperSync WARN/ERROR lines (last 200) ==="
+          docker compose -f docker-compose.yaml -f docker-compose.supersync.yaml logs --no-log-prefix supersync \
+            | grep -E '\[(WARN|ERROR)\]' | tail -n 200 || true
 
       - name: Stop Docker Services
         if: always()
@@ -252,10 +294,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: 22
           cache: 'npm'

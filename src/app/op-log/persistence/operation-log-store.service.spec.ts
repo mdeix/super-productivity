@@ -1,7 +1,9 @@
 import { fakeAsync, TestBed, tick } from '@angular/core/testing';
+import { CURRENT_SCHEMA_VERSION } from './schema-migration.service';
 import { IDBPDatabase, unwrap } from 'idb';
 import { forceCloseDatabase } from 'fake-indexeddb';
-import { OperationLogStoreService } from './operation-log-store.service';
+import { ImportBackupRef, OperationLogStoreService } from './operation-log-store.service';
+import { IMPORT_BACKUP_RING_SIZE } from './import-backup-ring.util';
 import { VectorClockService } from '../sync/vector-clock.service';
 import {
   ActionType,
@@ -21,8 +23,6 @@ import {
 import { CLIENT_ID_PROVIDER, ClientIdProvider } from '../util/client-id.provider';
 import { OP_LOG_DB_ADAPTER_FACTORY } from './op-log-db-adapter.token';
 import { OpLogDbAdapter } from './op-log-db-adapter';
-import { SqliteOpLogAdapter } from './sqlite-op-log-adapter';
-import { createSqlJsDb } from './sql-js-db.test-helper';
 import {
   IDB_OPEN_RETRIES,
   IDB_OPEN_RETRIES_NON_LOCK,
@@ -192,6 +192,36 @@ describe('OperationLogStoreService', () => {
       expect(initSpy).not.toHaveBeenCalled();
       expect((svc as unknown as { _db: unknown })._db).toBe(fakeDb);
     });
+
+    // #9187: an older build opening a database a newer build upgraded gets a
+    // VersionError. The version numbers can't change while we run, so the
+    // retry budget only delays the explanation behind a white screen.
+    it('fails fast without retrying when the downgrade barrier rejects the open', async () => {
+      const adapter = {
+        init: jasmine.createSpy('init').and.resolveTo(undefined),
+        adoptConnection: jasmine.createSpy('adoptConnection'),
+      } as unknown as OpLogDbAdapter;
+      const svc = freshServiceWith(adapter);
+      const openSpy = spyOn(
+        svc as unknown as { _openDbOnce: () => Promise<unknown> },
+        '_openDbOnce',
+      ).and.rejectWith(
+        new DOMException(
+          'The requested version (7) is less than the existing version (10).',
+          'VersionError',
+        ),
+      );
+
+      await expectAsync(svc.init()).toBeRejectedWithError(/Failed to open IndexedDB/);
+
+      // Exactly one attempt — no exponential-backoff budget burned.
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      // NOTE: without the fail-fast break this spec dies on the 2s jasmine
+      // timeout (src/test.ts) rather than on the assertion above, because the
+      // non-lock budget sleeps 1s+2s+4s. Do NOT "repair" a slow run here by
+      // raising DEFAULT_TIMEOUT_INTERVAL — that would turn this into a
+      // 7-second passing test that no longer guards anything.
+    });
   });
 
   describe('connection lifecycle handlers', () => {
@@ -360,6 +390,35 @@ describe('OperationLogStoreService', () => {
       expect(await service.getVectorClock()).toEqual(op.vectorClock);
     });
 
+    it('should preserve the full recovery clock in the atomic replay anchor', async () => {
+      const vectorClock = createBloatedClock({ testClient: 1 });
+      const op = createTestOperation({
+        id: 'legacy-recovery-full-clock-op',
+        vectorClock,
+      });
+
+      await service.appendRecoveryOperationAndSnapshot(op, { task: {} });
+
+      expect((await service.loadStateCache())?.vectorClock).toEqual(vectorClock);
+      expect(await service.getVectorClock()).toEqual(vectorClock);
+    });
+
+    it('should rebase a stale replay anchor onto the durable clock', async () => {
+      await service.setVectorClock({ testClient: 2, concurrentClient: 4 });
+      const op = createTestOperation({ vectorClock: { testClient: 1 } });
+
+      await service.appendOperationAndSnapshot(op, 'local', {
+        state: { task: {} },
+        vectorClock: op.vectorClock,
+        compactedAt: Date.now(),
+      });
+
+      const expectedClock = { testClient: 3, concurrentClient: 4 };
+      expect((await service.getOpById(op.id))?.op.vectorClock).toEqual(expectedClock);
+      expect((await service.loadStateCache())?.vectorClock).toEqual(expectedClock);
+      expect(await service.getVectorClock()).toEqual(expectedClock);
+    });
+
     it('should roll back the recovery operation when its snapshot write fails', async () => {
       const op = createTestOperation({ id: 'failed-legacy-recovery-op' });
       const adapter = (
@@ -514,6 +573,20 @@ describe('OperationLogStoreService', () => {
       const ops = await service.getOpsAfterSeq(0);
       const opsAfterLast = await service.getOpsAfterSeq(ops[0].seq);
       expect(opsAfterLast.length).toBe(0);
+    });
+  });
+
+  describe('countOps', () => {
+    it('should return 0 when the op-log is empty', async () => {
+      expect(await service.countOps()).toBe(0);
+    });
+
+    it('should return the total number of stored operations', async () => {
+      await service.append(createTestOperation({ entityId: 'task1' }));
+      await service.append(createTestOperation({ entityId: 'task2' }));
+      await service.append(createTestOperation({ entityId: 'task3' }));
+
+      expect(await service.countOps()).toBe(3);
     });
   });
 
@@ -683,6 +756,40 @@ describe('OperationLogStoreService', () => {
       const allOps = await service.getOpsAfterSeq(0);
       const lastSeq = await service.getLastSeq();
       expect(lastSeq).toBe(allOps[allOps.length - 1].seq);
+    });
+  });
+
+  describe('getFirstOpEntry', () => {
+    it('should return undefined when no operations exist', async () => {
+      expect(await service.getFirstOpEntry()).toBeUndefined();
+    });
+
+    it('should return the lowest-seq entry, decoded', async () => {
+      const first = createTestOperation({ entityId: 'task1' });
+      const second = createTestOperation({ entityId: 'task2' });
+      const firstSeq = await service.append(first, 'local');
+      await service.append(second, 'local');
+
+      const entry = await service.getFirstOpEntry();
+
+      expect(entry?.seq).toBe(firstSeq);
+      expect(entry?.op.id).toBe(first.id);
+      expect(entry?.op.entityId).toBe('task1');
+      expect(entry?.source).toBe('local');
+    });
+
+    it('pushes a limit of 1 into the adapter scan so SQLite reads a single row (#9932)', async () => {
+      await service.append(createTestOperation({ entityId: 'task1' }), 'local');
+      const adapter = (service as unknown as { _adapter: OpLogDbAdapter })._adapter;
+      const iterateSpy = spyOn(adapter, 'iterate').and.callThrough();
+
+      await service.getFirstOpEntry();
+
+      expect(iterateSpy).toHaveBeenCalledOnceWith(
+        STORE_NAMES.OPS,
+        jasmine.objectContaining({ mode: 'readonly', limit: 1 }),
+        jasmine.any(Function),
+      );
     });
   });
 
@@ -920,111 +1027,6 @@ describe('OperationLogStoreService', () => {
     });
   });
 
-  // The full-state metadata pointer is adapter-agnostic, but the rest of this
-  // suite drives it through the IndexedDB adapter. These tests pin the SAME
-  // behavior through the SQLite adapter (Android default, #8389) against a real
-  // engine (sql.js) — including the rebuild-on-read fallback, which is what
-  // keeps the pointer correct on SQLite (the IndexedDB-only populate-on-upgrade
-  // seed in db-upgrade.ts never runs there).
-  describe('full-state metadata over the SQLite backend', () => {
-    const freshSqliteService = async (): Promise<{
-      svc: OperationLogStoreService;
-      adapter: OpLogDbAdapter;
-    }> => {
-      const adapter = new SqliteOpLogAdapter(await createSqlJsDb());
-      TestBed.resetTestingModule();
-      TestBed.configureTestingModule({
-        providers: [
-          OperationLogStoreService,
-          { provide: CLIENT_ID_PROVIDER, useValue: mockClientIdProvider },
-          { provide: OP_LOG_DB_ADAPTER_FACTORY, useValue: () => adapter },
-        ],
-      });
-      const svc = TestBed.inject(OperationLogStoreService);
-      await svc.init();
-      return { svc, adapter };
-    };
-
-    it('tracks the latest full-state op by UUIDv7 without scanning', async () => {
-      const { svc, adapter } = await freshSqliteService();
-      await svc.append(
-        createTestOperation({
-          id: '01900000-0000-7000-8000-000000000001',
-          opType: OpType.SyncImport,
-          entityType: 'ALL' as EntityType,
-          entityId: undefined,
-        }),
-      );
-      await svc.append(
-        createTestOperation({ id: '01900000-0000-7000-8000-000000000002' }),
-      );
-      const latestImport = createTestOperation({
-        id: '01900000-0000-7000-8000-000000000003',
-        opType: OpType.BackupImport,
-        entityType: 'ALL' as EntityType,
-        entityId: undefined,
-      });
-      await svc.append(latestImport, 'remote');
-
-      const iterateSpy = spyOn(adapter, 'iterate').and.callThrough();
-
-      const latestEntry = await svc.getLatestFullStateOpEntry();
-      expect(latestEntry?.op.id).toBe(latestImport.id);
-      expect(latestEntry?.source).toBe('remote');
-      expect(iterateSpy).not.toHaveBeenCalled();
-    });
-
-    it('rebuilds the pointer on read when the meta row is absent', async () => {
-      const { svc, adapter } = await freshSqliteService();
-      await svc.append(
-        createTestOperation({ id: '01900000-0000-7000-8000-000000000012' }),
-      );
-      const latestImport = createTestOperation({
-        id: '01900000-0000-7000-8000-000000000013',
-        opType: OpType.SyncImport,
-        entityType: 'ALL' as EntityType,
-        entityId: undefined,
-      });
-      await svc.append(latestImport);
-
-      // Simulate the SQLite/migration state where the pointer was never seeded
-      // (the IndexedDB-only upgrade populate doesn't run on this backend).
-      await adapter.delete(STORE_NAMES.META, FULL_STATE_OPS_META_KEY);
-
-      const iterateSpy = spyOn(adapter, 'iterate').and.callThrough();
-      expect((await svc.getLatestFullStateOpEntry())?.op.id).toBe(latestImport.id);
-      expect(iterateSpy).toHaveBeenCalledTimes(1);
-
-      // The rebuild persisted the pointer → the second read does not scan again.
-      expect((await svc.getLatestFullStateOpEntry())?.op.id).toBe(latestImport.id);
-      expect(iterateSpy).toHaveBeenCalledTimes(1);
-    });
-
-    it('clears full-state ops through the metadata pointer', async () => {
-      const { svc, adapter } = await freshSqliteService();
-      await svc.append(
-        createTestOperation({
-          id: '01900000-0000-7000-8000-000000000021',
-          opType: OpType.SyncImport,
-          entityType: 'ALL' as EntityType,
-          entityId: undefined,
-        }),
-      );
-      await svc.append(
-        createTestOperation({ id: '01900000-0000-7000-8000-000000000022' }),
-      );
-
-      const iterateSpy = spyOn(adapter, 'iterate').and.callThrough();
-
-      expect(await svc.clearFullStateOps()).toBe(1);
-      expect(await svc.getLatestFullStateOpEntry()).toBeUndefined();
-      expect((await svc.getOpsAfterSeq(0)).map((entry) => entry.op.id)).toEqual([
-        '01900000-0000-7000-8000-000000000022',
-      ]);
-      expect(iterateSpy).not.toHaveBeenCalled();
-    });
-  });
-
   describe('state cache', () => {
     it('should save and load state cache', async () => {
       const testState = { task: { ids: ['1'], entities: { id1: { id: '1' } } } };
@@ -1087,6 +1089,7 @@ describe('OperationLogStoreService', () => {
       const testState = { task: { ids: [], entities: {} } };
 
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: testState,
         lastAppliedOpSeq: 10,
         vectorClock: {},
@@ -1109,6 +1112,7 @@ describe('OperationLogStoreService', () => {
 
     it('should increment counter', async () => {
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: {},
         lastAppliedOpSeq: 0,
         vectorClock: {},
@@ -1156,6 +1160,7 @@ describe('OperationLogStoreService', () => {
 
     it('should reset counter', async () => {
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: {},
         lastAppliedOpSeq: 0,
         vectorClock: {},
@@ -1218,6 +1223,7 @@ describe('OperationLogStoreService', () => {
     it('should merge clocks from snapshot and ops', async () => {
       // Save snapshot with initial clock
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: {},
         lastAppliedOpSeq: 0,
         vectorClock: { clientA: 5, clientB: 3 },
@@ -1593,6 +1599,7 @@ describe('OperationLogStoreService', () => {
       const newOp = createTestOperation({ id: 'snapshot-op-new' });
       await service.append(existingOp, 'remote');
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: { task: { ids: ['task1'] } },
         lastAppliedOpSeq: 1,
         vectorClock: { testClient: 1 },
@@ -1624,6 +1631,7 @@ describe('OperationLogStoreService', () => {
       const snapshotOp = createTestOperation({ id: 'snapshot-op-after-gap' });
       await service.append(existingOp, 'remote');
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: { task: { ids: [] } },
         lastAppliedOpSeq: 0,
         vectorClock: {},
@@ -1690,6 +1698,7 @@ describe('OperationLogStoreService', () => {
       const priorState = { sentinel: 'prior-state' };
       await service.append(priorOp, 'remote');
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: priorState,
         lastAppliedOpSeq: 1,
         vectorClock: { testClient: 1 },
@@ -1801,6 +1810,147 @@ describe('OperationLogStoreService', () => {
   });
 
   describe('appendMixedSourceBatchSkipDuplicates', () => {
+    it('should atomically append a replacement and reject its predecessors with one timestamp', async () => {
+      const firstPredecessor = createTestOperation({ id: 'first-predecessor' });
+      const secondPredecessor = createTestOperation({ id: 'second-predecessor' });
+      const replacement = createTestOperation({ id: 'replacement' });
+      await service.appendBatch([firstPredecessor, secondPredecessor], 'local');
+
+      // Populate the unsynced cache before the atomic transition.
+      expect((await service.getUnsynced()).map(({ op }) => op.id)).toEqual([
+        'first-predecessor',
+        'second-predecessor',
+      ]);
+
+      const result = await service.appendMixedSourceBatchSkipDuplicates(
+        [{ ops: [replacement], source: 'local' }],
+        { rejectOpIds: [firstPredecessor.id, secondPredecessor.id] },
+      );
+
+      expect(result.written.map(({ op }) => op.id)).toEqual(['replacement']);
+      const stored = await service.getOpsAfterSeq(0);
+      const rejectedAt = stored
+        .filter(({ op }) => op.id !== replacement.id)
+        .map((entry) => entry.rejectedAt);
+      expect(rejectedAt[0]).toBeDefined();
+      expect(rejectedAt[1]).toBe(rejectedAt[0]);
+      expect(
+        stored.find(({ op }) => op.id === replacement.id)?.rejectedAt,
+      ).toBeUndefined();
+      expect((await service.getUnsynced()).map(({ op }) => op.id)).toEqual([
+        'replacement',
+      ]);
+    });
+
+    it('should roll back replacement and predecessor rejection when the clock write fails', async () => {
+      await service.setVectorClock({ testClient: 4 });
+      const predecessor = createTestOperation({ id: 'rollback-predecessor' });
+      await service.append(predecessor, 'local');
+      expect((await service.getUnsynced()).map(({ op }) => op.id)).toEqual([
+        predecessor.id,
+      ]);
+
+      const adapter = (
+        service as unknown as {
+          _adapter: OpLogDbAdapter;
+        }
+      )._adapter;
+      const originalTransaction = adapter.transaction.bind(adapter);
+      spyOn(adapter, 'transaction').and.callFake(async (stores, mode, callback) =>
+        originalTransaction(stores, mode, async (tx) => {
+          const failingTx = new Proxy(tx, {
+            get: (target, property): unknown => {
+              if (property === 'put') {
+                return async (store: string, value: unknown, key?: string | number) => {
+                  if (store === STORE_NAMES.VECTOR_CLOCK) {
+                    throw new Error('injected atomic replacement clock failure');
+                  }
+                  return target.put(store, value, key);
+                };
+              }
+              const value = Reflect.get(target, property);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+          return callback(failingTx);
+        }),
+      );
+
+      await expectAsync(
+        service.appendMixedSourceBatchSkipDuplicates(
+          [
+            {
+              ops: [createTestOperation({ id: 'rolled-back-replacement' })],
+              source: 'local',
+            },
+          ],
+          { rejectOpIds: [predecessor.id] },
+        ),
+      ).toBeRejectedWithError('injected atomic replacement clock failure');
+
+      const stored = await service.getOpsAfterSeq(0);
+      expect(stored.map(({ op }) => op.id)).toEqual([predecessor.id]);
+      expect(stored[0].rejectedAt).toBeUndefined();
+      expect((await service.getUnsynced()).map(({ op }) => op.id)).toEqual([
+        predecessor.id,
+      ]);
+      service.clearVectorClockCache();
+      expect(await service.getVectorClock()).toEqual({ testClient: 4 });
+    });
+
+    it('should support atomically rejecting predecessors without appending a replacement', async () => {
+      const predecessor = createTestOperation({ id: 'rejection-only-predecessor' });
+      await service.append(predecessor, 'local');
+      expect((await service.getUnsynced()).map(({ op }) => op.id)).toEqual([
+        predecessor.id,
+      ]);
+
+      const result = await service.appendMixedSourceBatchSkipDuplicates([], {
+        rejectOpIds: [predecessor.id],
+      });
+
+      expect(result).toEqual({ written: [], skippedCount: 0 });
+      expect((await service.getOpById(predecessor.id))?.rejectedAt).toBeDefined();
+      expect(await service.getUnsynced()).toEqual([]);
+    });
+
+    it('should abort atomically when a predecessor to reject is missing', async () => {
+      const replacement = createTestOperation({ id: 'orphaned-replacement' });
+
+      await expectAsync(
+        service.appendMixedSourceBatchSkipDuplicates(
+          [{ ops: [replacement], source: 'local' }],
+          { rejectOpIds: ['missing-predecessor'] },
+        ),
+      ).toBeRejectedWithError(
+        'Cannot atomically reject missing operation missing-predecessor',
+      );
+
+      expect(await service.getOpsAfterSeq(0)).toEqual([]);
+    });
+
+    it('should abort atomically when a predecessor is already inactive', async () => {
+      const predecessor = createTestOperation({ id: 'inactive-predecessor' });
+      const replacement = createTestOperation({
+        id: 'replacement-for-inactive-predecessor',
+      });
+      await service.append(predecessor, 'local');
+      await service.markRejected([predecessor.id]);
+
+      await expectAsync(
+        service.appendMixedSourceBatchSkipDuplicates(
+          [{ ops: [replacement], source: 'local' }],
+          { rejectOpIds: [predecessor.id] },
+        ),
+      ).toBeRejectedWithError(
+        'Cannot atomically reject operation inactive-predecessor because it is not an active pending local operation',
+      );
+
+      expect((await service.getOpsAfterSeq(0)).map(({ op }) => op.id)).toEqual([
+        predecessor.id,
+      ]);
+    });
+
     it('should atomically order remote losers before monotonically clocked local compensations', async () => {
       await service.setVectorClock({ testClient: 5, existingClient: 2 });
       const remoteLoser = createTestOperation({
@@ -2735,16 +2885,161 @@ describe('OperationLogStoreService', () => {
       expect(await service.loadImportBackup()).toBeNull();
     });
 
-    it('should check if backup exists with hasImportBackup', async () => {
-      expect(await service.hasImportBackup()).toBe(false);
+    describe('recovery ring (local-recovery-points.md)', () => {
+      it('should prune to the newest entries and keep the undo pointer when it survives', async () => {
+        await service.saveImportBackup(
+          { v: 1 },
+          { reason: 'LOCAL_IMPORT', taskCount: 1 },
+        );
+        await service.saveImportBackup(
+          { v: 2 },
+          { reason: 'LOCAL_IMPORT', taskCount: 2 },
+        );
+        const newest = await service.saveImportBackup(
+          { v: 3 },
+          { reason: 'REMOTE_IMPORT', taskCount: 3 },
+        );
 
-      await service.saveImportBackup({ test: true });
+        expect(await service.pruneImportBackups(1)).toBe(2);
 
-      expect(await service.hasImportBackup()).toBe(true);
+        expect((await service.listImportBackups()).map((e) => e.backupId)).toEqual([
+          newest.backupId,
+        ]);
+        expect((await service.loadImportBackup())?.backupId).toBe(newest.backupId);
+        expect(await service.pruneImportBackups(1)).toBe(0);
+      });
 
-      await service.clearImportBackup();
+      for (const reason of ['LOCAL_IMPORT', 'REMOTE_IMPORT', 'FORCE_DOWNLOAD'] as const) {
+        it(`should clear the ${reason} snapshot and undo pointer when pruning to zero`, async () => {
+          const backup = await service.saveImportBackup(
+            { v: 1 },
+            { reason, taskCount: 1 },
+          );
 
-      expect(await service.hasImportBackup()).toBe(false);
+          expect(await service.pruneImportBackups(0)).toBe(1);
+
+          expect(await service.listImportBackups()).toEqual([]);
+          expect(await service.loadImportBackup()).toBeNull();
+          expect(await service.loadImportBackupById(backup.backupId)).toBeNull();
+        });
+      }
+
+      it('should list captures newest first with reason and task count', async () => {
+        await service.saveImportBackup(
+          { v: 1 },
+          { reason: 'LOCAL_IMPORT', taskCount: 5 },
+        );
+        const second = await service.saveImportBackup(
+          { v: 2 },
+          { reason: 'REMOTE_IMPORT', taskCount: 0 },
+        );
+
+        const list = await service.listImportBackups();
+        expect(list.length).toBe(2);
+        expect(list[0]).toEqual({
+          backupId: second.backupId,
+          savedAt: second.savedAt,
+          reason: 'REMOTE_IMPORT',
+          taskCount: 0,
+        });
+        expect(list[1].reason).toBe('LOCAL_IMPORT');
+        expect(list[1].taskCount).toBe(5);
+      });
+
+      it('should keep only the newest IMPORT_BACKUP_RING_SIZE snapshots', async () => {
+        const refs: ImportBackupRef[] = [];
+        for (let i = 0; i < IMPORT_BACKUP_RING_SIZE + 2; i++) {
+          refs.push(await service.saveImportBackup({ v: i }));
+        }
+
+        const list = await service.listImportBackups();
+        expect(list.length).toBe(IMPORT_BACKUP_RING_SIZE);
+        expect(list.map((e) => e.backupId)).toEqual(
+          refs
+            .slice(-IMPORT_BACKUP_RING_SIZE)
+            .reverse()
+            .map((r) => r.backupId),
+        );
+        // evicted snapshots are physically gone, kept ones still load
+        expect(await service.loadImportBackupById(refs[0].backupId)).toBeNull();
+        expect(await service.loadImportBackupById(refs[1].backupId)).toBeNull();
+        expect((await service.loadImportBackupById(refs[2].backupId))?.state).toEqual({
+          v: 2,
+        });
+      });
+
+      it('should never rotate the pre-loss capture out (#10003)', async () => {
+        const preLoss = await service.saveImportBackup(
+          { v: 'pre-loss' },
+          { reason: 'REMOTE_IMPORT', taskCount: 40 },
+        );
+        const restores: ImportBackupRef[] = [];
+        for (let i = 0; i < IMPORT_BACKUP_RING_SIZE; i++) {
+          restores.push(await service.saveImportBackup({ v: i }));
+        }
+
+        expect((await service.listImportBackups()).map((e) => e.backupId)).toEqual([
+          ...restores
+            .slice(1)
+            .reverse()
+            .map((r) => r.backupId),
+          preLoss.backupId,
+        ]);
+        expect((await service.loadImportBackupById(preLoss.backupId))?.state).toEqual({
+          v: 'pre-loss',
+        });
+        expect(await service.loadImportBackupById(restores[0].backupId)).toBeNull();
+      });
+
+      it('should keep the pre-loss capture over newer restores when pruning', async () => {
+        const preLoss = await service.saveImportBackup(
+          { v: 'pre-loss' },
+          { reason: 'REMOTE_IMPORT', taskCount: 40 },
+        );
+        await service.saveImportBackup({ v: 1 });
+        await service.saveImportBackup({ v: 2 });
+
+        expect(await service.pruneImportBackups(1)).toBe(2);
+
+        expect((await service.listImportBackups()).map((e) => e.backupId)).toEqual([
+          preLoss.backupId,
+        ]);
+        expect(await service.loadImportBackup()).toBeNull();
+      });
+
+      it('should keep an older snapshot browsable after the undo slot is cleared', async () => {
+        const first = await service.saveImportBackup({ v: 1 });
+        const second = await service.saveImportBackup({ v: 2 });
+
+        await service.clearImportBackup(second.backupId);
+
+        expect(await service.loadImportBackup()).toBeNull();
+        expect((await service.listImportBackups()).length).toBe(2);
+        expect((await service.loadImportBackupById(first.backupId))?.state).toEqual({
+          v: 1,
+        });
+      });
+
+      it('should still serve a legacy single-slot row for undo', async () => {
+        await service.init();
+        const raw = unwrap((service as any)._db as IDBPDatabase);
+        await new Promise<void>((resolve, reject) => {
+          const tx = raw.transaction(STORE_NAMES.IMPORT_BACKUP, 'readwrite');
+          tx.objectStore(STORE_NAMES.IMPORT_BACKUP).put({
+            id: SINGLETON_KEY,
+            state: { legacy: true },
+            savedAt: 42,
+          });
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+
+        const backup = await service.loadImportBackup();
+        expect(backup?.state).toEqual({ legacy: true });
+        expect(backup?.savedAt).toBe(42);
+        expect(backup?.backupId).toBeDefined();
+        expect(await service.listImportBackups()).toEqual([]);
+      });
     });
 
     it('should preserve complex nested data structures', async () => {
@@ -2792,6 +3087,7 @@ describe('OperationLogStoreService', () => {
 
       await service.saveImportBackup(importBackupState);
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: stateCacheState,
         lastAppliedOpSeq: 1,
         vectorClock: { client1: 1 } as VectorClock,
@@ -2944,6 +3240,7 @@ describe('OperationLogStoreService', () => {
       const priorArchiveOld = createArchive('prior-old');
       await service.append(priorOp);
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: { sentinel: 'prior-state' },
         lastAppliedOpSeq: 1,
         vectorClock: { testClient: 1 },
@@ -3388,6 +3685,7 @@ describe('OperationLogStoreService', () => {
       const priorOld = createArchive('prior-old');
       await service.append(priorOp);
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: priorState,
         lastAppliedOpSeq: 1,
         vectorClock: { testClient: 1 },
@@ -3683,6 +3981,7 @@ describe('OperationLogStoreService', () => {
     it('should fall back to snapshot+ops when vector_clock store is empty', async () => {
       // Save snapshot with vector clock (simulating pre-upgrade state)
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: {},
         lastAppliedOpSeq: 0,
         vectorClock: { snapshotClient: 50 },
@@ -3705,6 +4004,7 @@ describe('OperationLogStoreService', () => {
       await service.setVectorClock({ storeClient: 200 });
 
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: {},
         lastAppliedOpSeq: 0,
         vectorClock: { snapshotClient: 50 },
@@ -3801,6 +4101,7 @@ describe('OperationLogStoreService', () => {
         lastAppliedOpSeq: 5,
         vectorClock: { client1: 5 } as VectorClock,
         compactedAt: Date.now(),
+        schemaVersion: CURRENT_SCHEMA_VERSION,
       };
       await service.saveStateCache(stateCache);
 
@@ -4093,6 +4394,7 @@ describe('OperationLogStoreService', () => {
       await service.append(createImportOp('importAuthor', 1), 'remote');
 
       await service.saveStateCache({
+        schemaVersion: CURRENT_SCHEMA_VERSION,
         state: { some: 'state' },
         lastAppliedOpSeq: 1,
         vectorClock: createBloatedClock({ importAuthor: 1, testClient: 999 }),
@@ -4713,140 +5015,6 @@ describe('OperationLogStoreService', () => {
       // All are MIGRATION, so should return false
       const result = await service.hasSyncedOps();
       expect(result).toBe(false);
-    });
-  });
-
-  describe('clearUnsyncedOps', () => {
-    it('should mark all unsynced ops as rejected', async () => {
-      // Add some unsynced ops
-      const op1 = createTestOperation({
-        entityType: 'TASK' as EntityType,
-        entityId: 'task-1',
-        opType: OpType.Create,
-      });
-      const op2 = createTestOperation({
-        entityType: 'TASK' as EntityType,
-        entityId: 'task-2',
-        opType: OpType.Update,
-      });
-      await service.append(op1, 'local');
-      await service.append(op2, 'local');
-
-      // Verify they are unsynced
-      let unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(2);
-
-      // Clear unsynced ops
-      await service.clearUnsyncedOps();
-
-      // Should have no unsynced ops now
-      unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(0);
-    });
-
-    it('should not affect already synced ops', async () => {
-      // Add a synced op
-      const syncedOp = createTestOperation({
-        entityType: 'TASK' as EntityType,
-        entityId: 'task-synced',
-        opType: OpType.Create,
-      });
-      const seq1 = await service.append(syncedOp, 'local');
-      await service.markSynced([seq1]);
-
-      // Add an unsynced op
-      const unsyncedOp = createTestOperation({
-        entityType: 'TASK' as EntityType,
-        entityId: 'task-unsynced',
-        opType: OpType.Create,
-      });
-      await service.append(unsyncedOp, 'local');
-
-      // Clear unsynced ops
-      await service.clearUnsyncedOps();
-
-      // Synced op should still exist and be queryable by ID
-      const entry = await service.getOpById(syncedOp.id);
-      expect(entry).toBeTruthy();
-      expect(entry!.syncedAt).toBeDefined();
-      expect(entry!.rejectedAt).toBeUndefined();
-    });
-
-    it('should handle empty unsynced list gracefully', async () => {
-      // No ops added - nothing to clear
-      await expectAsync(service.clearUnsyncedOps()).toBeResolved();
-
-      // Should still have no unsynced ops
-      const unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(0);
-    });
-
-    it('should update rejectedAt timestamp for each cleared op', async () => {
-      const beforeClear = Date.now();
-
-      // Add unsynced op
-      const op = createTestOperation({
-        entityType: 'TASK' as EntityType,
-        entityId: 'task-1',
-        opType: OpType.Create,
-      });
-      await service.append(op, 'local');
-
-      // Clear unsynced ops
-      await service.clearUnsyncedOps();
-
-      const afterClear = Date.now();
-
-      // Get the stored entry directly to check rejectedAt
-      const entry = await service.getOpById(op.id);
-      expect(entry).toBeTruthy();
-      expect(entry!.rejectedAt).toBeDefined();
-      expect(entry!.rejectedAt).toBeGreaterThanOrEqual(beforeClear);
-      expect(entry!.rejectedAt).toBeLessThanOrEqual(afterClear);
-    });
-
-    it('should invalidate unsynced cache', async () => {
-      // Add unsynced ops
-      const op = createTestOperation({
-        entityType: 'TASK' as EntityType,
-        entityId: 'task-1',
-        opType: OpType.Create,
-      });
-      await service.append(op, 'local');
-
-      // Read unsynced (populates cache)
-      let unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(1);
-
-      // Clear unsynced ops
-      await service.clearUnsyncedOps();
-
-      // Should read from DB (cache invalidated) and show no unsynced ops
-      unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(0);
-    });
-
-    it('should clear multiple unsynced ops', async () => {
-      // Add multiple unsynced ops
-      for (let i = 0; i < 10; i++) {
-        const op = createTestOperation({
-          entityType: 'TASK' as EntityType,
-          entityId: `task-${i}`,
-          opType: OpType.Create,
-        });
-        await service.append(op, 'local');
-      }
-
-      // Verify they are all unsynced
-      let unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(10);
-
-      // Clear all
-      await service.clearUnsyncedOps();
-
-      // Should have none
-      unsynced = await service.getUnsynced();
-      expect(unsynced.length).toBe(0);
     });
   });
 

@@ -13,6 +13,7 @@ import {
 } from '../core/operation-log.const';
 import { toEntityKey } from '../util/entity-key.util';
 import { RepairOperationService } from '../validation/repair-operation.service';
+import { OperationLogDownloadService } from './operation-log-download.service';
 
 const REPAIR_SUMMARY_KEYS: readonly (keyof RepairSummary)[] = [
   'entityStateFixed',
@@ -44,6 +45,8 @@ const getRepairSummary = (payload: unknown): RepairSummary | undefined => {
   }
   return summaryRecord as unknown as RepairSummary;
 };
+
+const MAX_LOGGED_REJECTION_CLOCK_SAMPLES = 5;
 
 // Re-export for consumers that import from this service
 export type {
@@ -100,6 +103,7 @@ export class RejectedOpsHandlerService {
   private snackService = inject(SnackService);
   private supersededOperationResolver = inject(SupersededOperationResolverService);
   private repairOperationService = inject(RepairOperationService);
+  private downloadService = inject(OperationLogDownloadService);
 
   /**
    * Tracks resolution attempts per entity key (entityType:entityId) to prevent infinite loops.
@@ -208,7 +212,13 @@ export class RejectedOpsHandlerService {
       // - Op doesn't exist (was somehow removed)
       // - Op is already synced (was accepted after all)
       // - Op is already rejected (conflict resolution already handled it)
-      if (!entry || entry.syncedAt || entry.rejectedAt) {
+      if (
+        !entry ||
+        entry.source !== 'local' ||
+        entry.syncedAt !== undefined ||
+        entry.rejectedAt !== undefined ||
+        entry.reducerRejectedAt !== undefined
+      ) {
         continue;
       }
 
@@ -423,6 +433,18 @@ export class RejectedOpsHandlerService {
         this._rollbackResolutionAttempts(opsToResolve);
         return { kind: 'cancelled' };
       }
+      mergedOpsCreated += downloadResult.localWinOpsCreated ?? 0;
+      // The pass stopped short of the server head (#8763), so the op this
+      // rejection is about may still be unseen. Resolving now would give the
+      // local op a clock that silently beats it; retry after the next pass.
+      if (this.downloadService.hasUnseenRemoteOps()) {
+        this._rollbackResolutionAttempts(opsToResolve);
+        return {
+          kind: 'completed',
+          mergedOpsCreated,
+          retryExceededCount: opsExceededRetries.length,
+        };
+      }
 
       // Helper to check which ops are still pending, preserving existingClock from rejection
       const getStillPendingOps = async (): Promise<
@@ -435,7 +457,12 @@ export class RejectedOpsHandlerService {
         }> = [];
         for (const { opId, op, existingClock } of opsToResolve) {
           const entry = await this.opLogStore.getOpById(opId);
-          if (entry && !entry.syncedAt && !entry.rejectedAt) {
+          if (
+            entry?.source === 'local' &&
+            entry.syncedAt === undefined &&
+            entry.rejectedAt === undefined &&
+            entry.reducerRejectedAt === undefined
+          ) {
             pending.push({ opId, op, existingClock });
           }
         }
@@ -454,21 +481,37 @@ export class RejectedOpsHandlerService {
       // If download got new ops, conflict detection already happened in _processRemoteOps
       // If download got nothing (newOpsCount === 0), we need to resolve locally
       if (downloadResult.newOpsCount === 0) {
-        const stillPendingOps = await getStillPendingOps();
+        let stillPendingOps = await getStillPendingOps();
 
         if (stillPendingOps.length > 0) {
           // Normal download returned 0 ops but concurrent ops still pending.
           // This means our local clock is likely missing entries the server has.
           // Try a FORCE download from seq 0 to get ALL op clocks.
+          await this._logUnexplainedRejectionClocks(stillPendingOps);
           OpLog.normal(
             `RejectedOpsHandlerService: Download returned no new ops but ${stillPendingOps.length} ` +
               `concurrent ops still pending. Forcing full download from seq 0...`,
           );
 
-          const forceDownloadResult = await downloadCallback({ forceFromSeq0: true });
+          const forceDownloadResult = await downloadCallback({
+            forceFromSeq0: true,
+            isReDeliveryRetry: true,
+          });
           if (forceDownloadResult.kind === 'cancelled') {
             this._rollbackResolutionAttempts(opsToResolve);
             return { kind: 'cancelled' };
+          }
+          mergedOpsCreated += forceDownloadResult.localWinOpsCreated ?? 0;
+
+          // The forced download can itself resolve the conflict and retire the
+          // original op. Never pass the stale pre-download list to the resolver.
+          stillPendingOps = await getStillPendingOps();
+          if (stillPendingOps.length === 0) {
+            return {
+              kind: 'completed',
+              mergedOpsCreated,
+              retryExceededCount: opsExceededRetries.length,
+            };
           }
 
           // Use the clocks from force download to resolve superseded ops
@@ -578,6 +621,39 @@ export class RejectedOpsHandlerService {
       mergedOpsCreated,
       retryExceededCount: opsExceededRetries.length,
     };
+  }
+
+  /**
+   * Diagnostics for rejections no downloaded op explains: per sampled op, the
+   * [server, op, local] counters of each client where the server is ahead.
+   * Ids and counters only — no user content.
+   */
+  private async _logUnexplainedRejectionClocks(
+    ops: Array<{ opId: string; op: Operation; existingClock?: VectorClock }>,
+  ): Promise<void> {
+    try {
+      const localClock = (await this.opLogStore.getVectorClock()) ?? {};
+      OpLog.warn('RejectedOpsHandlerService: Rejected ops not explained by remote ops', {
+        count: ops.length,
+        samples: ops
+          .slice(0, MAX_LOGGED_REJECTION_CLOCK_SAMPLES)
+          .map(({ opId, op, existingClock }) => ({
+            opId,
+            opClientId: op.clientId,
+            serverAhead: Object.fromEntries(
+              Object.entries(existingClock ?? {})
+                .filter(([id, counter]) => counter > (op.vectorClock[id] ?? 0))
+                .map(([id, counter]) => [
+                  id,
+                  [counter, op.vectorClock[id] ?? 0, localClock[id] ?? 0],
+                ]),
+            ),
+          })),
+      });
+    } catch (e) {
+      // Diagnostics only — never block conflict resolution.
+      OpLog.verbose('RejectedOpsHandlerService: rejection clock diagnostics failed', e);
+    }
   }
 
   private _rollbackResolutionAttempts(ops: ReadonlyArray<{ op: Operation }>): void {
